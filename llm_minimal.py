@@ -12,6 +12,7 @@ YOUR_API_KEY = ""
 INPUT_PRICE_PER_1M = 174.0
 OUTPUT_PRICE_PER_1M = 1396.0
 CURRENCY = "RUB"
+DEFAULT_HISTORY_LIMIT = 10
 
 HISTORY_DIR = Path("history")
 LAST_SESSION_FILE = HISTORY_DIR / "last_session.txt"
@@ -29,6 +30,10 @@ def ensure_history_dir() -> None:
 
 def session_path(session_id: str) -> Path:
     return HISTORY_DIR / f"session_{session_id}.json"
+
+
+def metrics_path(session_id: str) -> Path:
+    return HISTORY_DIR / f"session_{session_id}_metrics.json"
 
 
 def create_session_id() -> str:
@@ -53,6 +58,54 @@ def load_session(session_id: str) -> list[dict]:
     if isinstance(data, list):
         return data
     return []
+
+
+def default_metrics() -> dict:
+    return {
+        "response_count": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "input_cost": 0.0,
+        "output_cost": 0.0,
+        "total_cost": 0.0,
+        "total_response_time_sec": 0.0,
+    }
+
+
+def load_metrics(session_id: str) -> dict:
+    path = metrics_path(session_id)
+    if not path.exists():
+        return default_metrics()
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default_metrics()
+
+    metrics = default_metrics()
+    if not isinstance(data, dict):
+        return metrics
+
+    for key, default_value in metrics.items():
+        value = data.get(key, default_value)
+        if isinstance(default_value, int):
+            try:
+                metrics[key] = int(value)
+            except (TypeError, ValueError):
+                metrics[key] = default_value
+        else:
+            try:
+                metrics[key] = float(value)
+            except (TypeError, ValueError):
+                metrics[key] = default_value
+
+    return metrics
+
+
+def save_metrics(session_id: str, metrics: dict) -> None:
+    path = metrics_path(session_id)
+    path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def read_last_session_id() -> Optional[str]:
@@ -92,6 +145,55 @@ def session_preview(messages: list[dict]) -> str:
             return content[:60]
 
     return "empty"
+
+
+def dialog_messages(messages: list[dict]) -> list[dict]:
+    return [item for item in messages if item.get("role") in {"user", "assistant"}]
+
+
+def print_history(messages: list[dict], limit: Optional[int] = DEFAULT_HISTORY_LIMIT) -> None:
+    visible_messages = dialog_messages(messages)
+    if not visible_messages:
+        print("\nNo previous messages in this session.")
+        return
+
+    if limit is None:
+        messages_to_show = visible_messages
+        print("\nPrevious messages (all):")
+    else:
+        messages_to_show = visible_messages[-limit:]
+        print(f"\nPrevious messages (last {limit}):")
+
+    for item in messages_to_show:
+        role = item.get("role")
+        role_label = "You" if role == "user" else "AI"
+        content = str(item.get("content", "")).strip() or "<empty>"
+        print(f"{role_label}: {content}")
+
+
+def print_summary(messages: list[dict], metrics: dict) -> None:
+    visible_messages = dialog_messages(messages)
+    user_messages = sum(1 for item in visible_messages if item.get("role") == "user")
+    assistant_messages = sum(1 for item in visible_messages if item.get("role") == "assistant")
+
+    response_count = metrics.get("response_count", 0)
+    total_response_time_sec = metrics.get("total_response_time_sec", 0.0)
+    average_response_time = (
+        total_response_time_sec / response_count if response_count > 0 else 0.0
+    )
+
+    print("\nSession summary:")
+    print(f"Session messages (user+assistant): {len(visible_messages)}")
+    print(f"User messages: {user_messages}")
+    print(f"Assistant messages: {assistant_messages}")
+    print(f"Tracked responses: {response_count}")
+    print(f"Prompt tokens (sum): {metrics.get('prompt_tokens', 0)}")
+    print(f"Completion tokens (sum): {metrics.get('completion_tokens', 0)}")
+    print(f"Total tokens (sum): {metrics.get('total_tokens', 0)}")
+    print(f"Input cost (sum): {metrics.get('input_cost', 0.0):.6f} {CURRENCY}")
+    print(f"Output cost (sum): {metrics.get('output_cost', 0.0):.6f} {CURRENCY}")
+    print(f"Total cost (sum): {metrics.get('total_cost', 0.0):.6f} {CURRENCY}")
+    print(f"Average response time: {average_response_time:.2f} sec")
 
 
 def choose_session() -> tuple[str, list[dict]]:
@@ -164,8 +266,13 @@ def choose_session() -> tuple[str, list[dict]]:
 
 current_session_id, messages = choose_session()
 write_last_session_id(current_session_id)
+session_metrics = load_metrics(current_session_id)
 
-print(f"\nTerminal chat started. Session: {current_session_id}. Type 'exit' to quit.")
+print_history(messages, DEFAULT_HISTORY_LIMIT)
+print(
+    f"\nTerminal chat started. Session: {current_session_id}. "
+    "Type 'exit' to quit. Use '/history all' to print full history. Use '/summary' for session stats."
+)
 
 while True:
     user_input = input("You: ").strip()
@@ -173,6 +280,18 @@ while True:
     if user_input.lower() in {"exit", "quit"}:
         print("Bye!")
         break
+
+    if user_input.lower() == "/history all":
+        print_history(messages, limit=None)
+        continue
+
+    if user_input.lower() == "/history":
+        print_history(messages, limit=DEFAULT_HISTORY_LIMIT)
+        continue
+
+    if user_input.lower() == "/summary":
+        print_summary(messages, session_metrics)
+        continue
 
     if not user_input:
         continue
@@ -198,6 +317,15 @@ while True:
     output_cost = (completion_tokens / 1_000_000) * OUTPUT_PRICE_PER_1M
     total_cost = input_cost + output_cost
 
+    session_metrics["response_count"] += 1
+    session_metrics["prompt_tokens"] += prompt_tokens
+    session_metrics["completion_tokens"] += completion_tokens
+    session_metrics["total_tokens"] += total_tokens
+    session_metrics["input_cost"] += input_cost
+    session_metrics["output_cost"] += output_cost
+    session_metrics["total_cost"] += total_cost
+    session_metrics["total_response_time_sec"] += elapsed_seconds
+
     print(f"AI: {assistant_text}")
     print(f"Prompt tokens: {prompt_tokens}")
     print(f"Completion tokens: {completion_tokens}")
@@ -209,3 +337,4 @@ while True:
 
     messages.append({"role": "assistant", "content": assistant_text})
     save_session(current_session_id, messages)
+    save_metrics(current_session_id, session_metrics)
