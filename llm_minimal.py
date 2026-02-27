@@ -13,6 +13,15 @@ INPUT_PRICE_PER_1M = 174.0
 OUTPUT_PRICE_PER_1M = 1396.0
 CURRENCY = "RUB"
 DEFAULT_HISTORY_LIMIT = 10
+SUMMARY_SYSTEM_PROMPT = (
+    "Use the provided conversation summary as context from previous turns. "
+    "Treat it as trusted prior chat memory."
+)
+SUMMARY_UPDATE_SYSTEM_PROMPT = (
+    "You update a running summary of a chat. Keep only facts, decisions, constraints, "
+    "user preferences, and unresolved questions. Remove repetition. "
+    "Write concise plain text in Russian. Return only the updated summary."
+)
 
 HISTORY_DIR = Path("history")
 LAST_SESSION_FILE = HISTORY_DIR / "last_session.txt"
@@ -30,6 +39,10 @@ def ensure_history_dir() -> None:
 
 def session_path(session_id: str) -> Path:
     return HISTORY_DIR / f"session_{session_id}.json"
+
+
+def summary_path(session_id: str) -> Path:
+    return HISTORY_DIR / f"session_{session_id}_summary.json"
 
 
 def metrics_path(session_id: str) -> Path:
@@ -58,6 +71,35 @@ def load_session(session_id: str) -> list[dict]:
     if isinstance(data, list):
         return data
     return []
+
+
+def default_summary_data() -> dict:
+    return {"summary": ""}
+
+
+def load_summary(session_id: str) -> dict:
+    path = summary_path(session_id)
+    if not path.exists():
+        return default_summary_data()
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default_summary_data()
+
+    if not isinstance(data, dict):
+        return default_summary_data()
+
+    summary = data.get("summary", "")
+    if not isinstance(summary, str):
+        summary = ""
+
+    return {"summary": summary}
+
+
+def save_summary(session_id: str, summary_data: dict) -> None:
+    path = summary_path(session_id)
+    path.write_text(json.dumps(summary_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def default_metrics() -> dict:
@@ -149,6 +191,100 @@ def session_preview(messages: list[dict]) -> str:
 
 def dialog_messages(messages: list[dict]) -> list[dict]:
     return [item for item in messages if item.get("role") in {"user", "assistant"}]
+
+
+def get_last_assistant_message(messages: list[dict]) -> str:
+    for item in reversed(messages):
+        if item.get("role") == "assistant":
+            return str(item.get("content", "")).strip()
+    return ""
+
+
+def messages_without_last_assistant(messages: list[dict]) -> list[dict]:
+    last_assistant_index = None
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "assistant":
+            last_assistant_index = index
+            break
+
+    if last_assistant_index is None:
+        return list(messages)
+
+    return messages[:last_assistant_index] + messages[last_assistant_index + 1:]
+
+
+def format_messages_for_summary(messages: list[dict]) -> str:
+    lines = []
+    for item in messages:
+        role = item.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        prefix = "User" if role == "user" else "Assistant"
+        content = str(item.get("content", "")).strip()
+        if content:
+            lines.append(f"{prefix}: {content}")
+    return "\n".join(lines)
+
+
+def build_request_messages(summary_text: str, last_assistant_text: str, user_input: str) -> list[dict]:
+    request_messages = []
+    if summary_text.strip():
+        request_messages.append(
+            {
+                "role": "system",
+                "content": f"{SUMMARY_SYSTEM_PROMPT}\n\nSummary:\n{summary_text.strip()}",
+            }
+        )
+
+    if last_assistant_text.strip():
+        request_messages.append({"role": "assistant", "content": last_assistant_text.strip()})
+
+    request_messages.append({"role": "user", "content": user_input})
+    return request_messages
+
+
+def update_running_summary(summary_text: str, new_messages: list[dict]) -> str:
+    formatted_chunk = format_messages_for_summary(new_messages)
+    if not formatted_chunk:
+        return summary_text
+
+    summary_request = [
+        {"role": "system", "content": SUMMARY_UPDATE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Current summary:\n{summary_text.strip() or '(empty)'}\n\n"
+                f"New messages:\n{formatted_chunk}\n\n"
+                "Return updated summary."
+            ),
+        },
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model="openai/gpt-5.2",
+            messages=summary_request,
+        )
+    except Exception as error:
+        print(f"Warning: summary update failed: {error}")
+        return summary_text
+
+    new_summary = response.choices[0].message.content or ""
+    return new_summary.strip() or summary_text
+
+
+def bootstrap_summary_if_needed(session_id: str, messages: list[dict], summary_data: dict) -> dict:
+    if summary_data.get("summary", "").strip():
+        return summary_data
+
+    source_messages = dialog_messages(messages_without_last_assistant(messages))
+    if not source_messages:
+        return summary_data
+
+    print("Preparing session summary from previous history...")
+    summary_data["summary"] = update_running_summary("", source_messages)
+    save_summary(session_id, summary_data)
+    return summary_data
 
 
 def print_history(messages: list[dict], limit: Optional[int] = DEFAULT_HISTORY_LIMIT) -> None:
@@ -267,6 +403,8 @@ def choose_session() -> tuple[str, list[dict]]:
 current_session_id, messages = choose_session()
 write_last_session_id(current_session_id)
 session_metrics = load_metrics(current_session_id)
+session_summary = load_summary(current_session_id)
+session_summary = bootstrap_summary_if_needed(current_session_id, messages, session_summary)
 
 print_history(messages, DEFAULT_HISTORY_LIMIT)
 print(
@@ -296,13 +434,20 @@ while True:
     if not user_input:
         continue
 
+    last_assistant_text = get_last_assistant_message(messages)
+    request_messages = build_request_messages(
+        session_summary.get("summary", ""),
+        last_assistant_text,
+        user_input,
+    )
+
     messages.append({"role": "user", "content": user_input})
     save_session(current_session_id, messages)
 
     started_at = time.perf_counter()
     response = client.chat.completions.create(
         model="openai/gpt-5.2",
-        messages=messages
+        messages=request_messages
     )
     elapsed_seconds = time.perf_counter() - started_at
 
@@ -334,6 +479,16 @@ while True:
     print(f"Input cost: {input_cost:.6f} {CURRENCY}")
     print(f"Output cost: {output_cost:.6f} {CURRENCY}")
     print(f"Total cost: {total_cost:.6f} {CURRENCY}")
+
+    summary_chunk = []
+    if last_assistant_text:
+        summary_chunk.append({"role": "assistant", "content": last_assistant_text})
+    summary_chunk.append({"role": "user", "content": user_input})
+    session_summary["summary"] = update_running_summary(
+        session_summary.get("summary", ""),
+        summary_chunk,
+    )
+    save_summary(current_session_id, session_summary)
 
     messages.append({"role": "assistant", "content": assistant_text})
     save_session(current_session_id, messages)
