@@ -46,6 +46,12 @@ TOD_SYSTEM_PROMPT_TEMPLATE = (
     "For any non-cooking question, answer exactly this text and nothing else:\n"
     f"{TOD_OUT_OF_SCOPE_MESSAGE}"
 )
+PERSONALITY_AGENT_SYSTEM_PROMPT_TEMPLATE = (
+    "You are a highly professional assistant.\n"
+    "Assistant profile:\n{profile}\n\n"
+    "User preferences (style, format, constraints):\n{preferences}\n\n"
+    "Follow the profile and preferences strictly in every answer."
+)
 SUMMARY_UPDATE_SYSTEM_PROMPT = (
     "You update a running summary of a chat. Keep only facts, decisions, constraints, "
     "user preferences, and unresolved questions. Remove repetition. "
@@ -59,6 +65,7 @@ TOD_WORKING_MEMORY_DIR = TOD_DIR / "working_memory"
 TOD_LONG_TERM_MEMORY_FILE = TOD_DIR / "long_term_memory.json"
 TOD_LAST_CHAT_FILE = TOD_DIR / "last_chat.txt"
 TOD_CHAT_SENTINEL = "__TOD_CHAT__"
+AGENT_CHAT_SENTINEL = "__PERSONALITY_AGENT_CHAT__"
 
 
 client = OpenAI(
@@ -472,6 +479,80 @@ def run_tod_chat(chat_id: str) -> str:
             "Add fact for next context (enter 0 to skip): ",
         )
 
+
+def prompt_required_input(prompt_text: str) -> str:
+    while True:
+        print(prompt_text)
+        value = input("> ").strip()
+        if value:
+            return value
+        print("Поле не может быть пустым. Введите текст.")
+
+
+def run_personality_agent_chat() -> str:
+    profile = prompt_required_input("Задайте профиль ассистента")
+    preferences = prompt_required_input("Опишите предпочтения (стиль, формат, ограничения)")
+
+    system_prompt = PERSONALITY_AGENT_SYSTEM_PROMPT_TEMPLATE.format(
+        profile=profile,
+        preferences=preferences,
+    )
+    short_term_messages = []
+
+    print(
+        "\nCreate personality agent started. "
+        "Type 'exit' to quit program or '/switch' to return session menu."
+    )
+
+    while True:
+        user_input = input("You: ").strip()
+
+        if user_input.lower() in {"exit", "quit"}:
+            print("Bye!")
+            return "exit"
+
+        if user_input.lower() == "/switch":
+            print("Returning to session menu...")
+            return "switch"
+
+        if not user_input:
+            continue
+
+        request_messages = [{"role": "system", "content": system_prompt}]
+        request_messages.extend(short_term_messages)
+        request_messages.append({"role": "user", "content": user_input})
+
+        started_at = time.perf_counter()
+        response = client.chat.completions.create(
+            model="openai/gpt-5.2",
+            messages=request_messages,
+        )
+        elapsed_seconds = time.perf_counter() - started_at
+
+        assistant_text = response.choices[0].message.content or ""
+        usage = response.usage
+
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+        total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
+
+        input_cost = (prompt_tokens / 1_000_000) * INPUT_PRICE_PER_1M
+        output_cost = (completion_tokens / 1_000_000) * OUTPUT_PRICE_PER_1M
+        total_cost = input_cost + output_cost
+
+        print(f"AI: {assistant_text}")
+        print(f"Prompt tokens: {prompt_tokens}")
+        print(f"Completion tokens: {completion_tokens}")
+        print(f"Total tokens: {total_tokens}")
+        print(f"Response time: {elapsed_seconds:.2f} sec")
+        print(f"Input cost: {input_cost:.6f} {CURRENCY}")
+        print(f"Output cost: {output_cost:.6f} {CURRENCY}")
+        print(f"Total cost: {total_cost:.6f} {CURRENCY}")
+
+        short_term_messages.append({"role": "user", "content": user_input})
+        short_term_messages.append({"role": "assistant", "content": assistant_text})
+
+
 def load_strategy(session_id: str) -> int:
     path = strategy_path(session_id)
     if not path.exists():
@@ -811,10 +892,14 @@ def choose_session() -> tuple[str, list[dict]]:
 
         print("\nСhat with Tod chef cooking")
         print("Type Tod to open this chat.")
+        print("\nCreate personality agent")
+        print("Type agent to open this chat.")
 
         choice = input("Select option: ").strip()
         if choice.lower() == "tod":
             return TOD_CHAT_SENTINEL, []
+        if choice.lower() == "agent":
+            return AGENT_CHAT_SENTINEL, []
         action = option_map.get(choice)
 
         if action == "continue_last" and last_session_id:
@@ -871,6 +956,12 @@ while True:
 
         tod_result = run_tod_chat(tod_chat_id)
         if tod_result == "exit":
+            break
+        continue
+
+    if current_session_id == AGENT_CHAT_SENTINEL:
+        agent_result = run_personality_agent_chat()
+        if agent_result == "exit":
             break
         continue
 
