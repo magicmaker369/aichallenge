@@ -52,21 +52,17 @@ PERSONALITY_AGENT_SYSTEM_PROMPT_TEMPLATE = (
     "User preferences (style, format, constraints):\n{preferences}\n\n"
     "Follow the profile and preferences strictly in every answer."
 )
-TRAVEL_OUT_OF_SCOPE_MESSAGE = (
-    "Я не эксперт в этой области, вам лучше обратиться в другой чат."
-)
-TRAVEL_CLASSIFIER_SYSTEM_PROMPT = (
-    "Classify whether a user message is about travel only. "
-    "Travel includes trips, routes, countries, cities, transport, flights, trains, "
-    "hotels, visa, insurance, attractions, itineraries, budget, safety, and local tips. "
-    "Return ONLY YES or NO."
-)
 TRAVEL_PLANNING_SYSTEM_PROMPT = (
     "You are a world-class travel industry expert.\n"
     "Current stage: Planning.\n"
     "Your goal is to gather all requirements, ask clarifying questions, and form a clear plan.\n"
-    "If user message is not about travel, respond with exact text and nothing else:\n"
-    f"{TRAVEL_OUT_OF_SCOPE_MESSAGE}\n"
+    "Answer in Russian."
+)
+TRAVEL_PLANNING_CLARIFICATION_PROMPT = (
+    "You are a world-class travel industry expert.\n"
+    "Current stage: Planning.\n"
+    "Ask exactly one clarifying question based on user requirements and current context.\n"
+    "Do not generate a plan.\n"
     "Answer in Russian."
 )
 TRAVEL_PLAN_SYNTHESIS_SYSTEM_PROMPT = (
@@ -632,28 +628,34 @@ def print_ai_with_stats(assistant_text: str, stats: dict) -> None:
     print(f"Total cost: {stats['total_cost']:.6f} {CURRENCY}")
 
 
-def is_travel_related_query(user_input: str) -> bool:
-    request_messages = [
-        {"role": "system", "content": TRAVEL_CLASSIFIER_SYSTEM_PROMPT},
-        {"role": "user", "content": user_input},
-    ]
-    try:
-        result, _stats = model_completion_with_stats(request_messages)
-    except Exception:
-        return True
+class invariant:
+    def __init__(self, max_clarifications: int = 2):
+        self.max_clarifications = max_clarifications
+        self.clarifications_used = 0
+        self.plan_presented = False
 
-    normalized = result.strip().upper()
-    if normalized.startswith("NO"):
-        return False
-    if normalized.startswith("YES"):
-        return True
-    return True
+    def can_ask_clarification(self) -> bool:
+        return self.clarifications_used < self.max_clarifications and not self.plan_presented
+
+    def register_clarification(self) -> None:
+        if self.clarifications_used < self.max_clarifications:
+            self.clarifications_used += 1
+
+    def clarification_limit_reached(self) -> bool:
+        return self.clarifications_used >= self.max_clarifications
+
+    def mark_plan_presented(self) -> None:
+        self.plan_presented = True
+
+    def can_approve_plan(self) -> bool:
+        return self.plan_presented
 
 
 def new_travel_plan_state() -> dict:
     return {
         "stage": "planning",
         "planning_notes": [],
+        "draft_plan": "",
         "approved_plan": "",
         "execution_output": "",
         "validation_output": "",
@@ -687,6 +689,20 @@ def synthesize_travel_plan(planning_notes: list[str], conversation_messages: lis
 
     plan_text, _stats = model_completion_with_stats(request_messages)
     return plan_text.strip()
+
+
+def generate_planning_draft_plan(state: dict) -> str:
+    return synthesize_travel_plan(
+        state["planning_notes"],
+        state["conversation_messages"],
+    ).strip()
+
+
+def show_draft_plan(plan_text: str) -> None:
+    print("\nGenerated plan:")
+    print(plan_text)
+    print("\nЕсли нужно изменить план — напишите правки.")
+    print("Для перехода в Execution введите /approve_plan.")
 
 
 def run_travel_execution(plan_text: str, planning_notes: list[str]) -> str:
@@ -733,6 +749,7 @@ def run_travel_validation(plan_text: str, execution_output: str) -> str:
 
 def run_travel_plan_chat() -> str:
     state = new_travel_plan_state()
+    planning_invariant = invariant(max_clarifications=2)
 
     print(
         "\nAgent with Plan Mode, for travel started. "
@@ -775,6 +792,7 @@ def run_travel_plan_chat() -> str:
             print(state["validation_output"])
             print("\nDone. You can start a new travel request.")
             state = new_travel_plan_state()
+            planning_invariant = invariant(max_clarifications=2)
             continue
 
         user_input = input("You: ").strip()
@@ -788,25 +806,13 @@ def run_travel_plan_chat() -> str:
             return "switch"
 
         if user_input.lower() == "/approve_plan":
-            if not state["planning_notes"]:
-                print("Сначала опишите требования к путешествию, затем утвердите план.")
-                continue
-            try:
-                approved_plan = synthesize_travel_plan(
-                    state["planning_notes"],
-                    state["conversation_messages"],
-                )
-            except Exception as error:
-                print(f"Plan synthesis failed: {error}")
+            if not planning_invariant.can_approve_plan():
+                print("Команда /approve_plan доступна только после показа плана.")
                 continue
 
-            if not approved_plan:
-                print("Не удалось сформировать план. Добавьте уточнения и попробуйте снова.")
-                continue
-
-            state["approved_plan"] = approved_plan
+            state["approved_plan"] = state["draft_plan"]
             print("\nApproved plan:")
-            print(approved_plan)
+            print(state["approved_plan"])
             print("\nPlan approved. Moving to Execution...")
             state["stage"] = "execution"
             continue
@@ -814,25 +820,54 @@ def run_travel_plan_chat() -> str:
         if not user_input:
             continue
 
-        if not is_travel_related_query(user_input):
-            print(f"AI: {TRAVEL_OUT_OF_SCOPE_MESSAGE}")
-            continue
-
-        request_messages = [{"role": "system", "content": TRAVEL_PLANNING_SYSTEM_PROMPT}]
-        request_messages.extend(state["conversation_messages"])
-        request_messages.append({"role": "user", "content": user_input})
-
-        try:
-            assistant_text, stats = model_completion_with_stats(request_messages)
-        except Exception as error:
-            print(f"AI: Не удалось получить ответ: {error}")
-            continue
-
-        print_ai_with_stats(assistant_text, stats)
-
         state["planning_notes"].append(user_input)
         state["conversation_messages"].append({"role": "user", "content": user_input})
-        state["conversation_messages"].append({"role": "assistant", "content": assistant_text})
+
+        if not planning_invariant.plan_presented:
+            if planning_invariant.clarification_limit_reached():
+                try:
+                    draft_plan = generate_planning_draft_plan(state)
+                except Exception as error:
+                    print(f"Plan synthesis failed: {error}")
+                    continue
+
+                if not draft_plan:
+                    print("Не удалось сформировать план. Добавьте правки и попробуйте снова.")
+                    continue
+
+                state["draft_plan"] = draft_plan
+                planning_invariant.mark_plan_presented()
+                show_draft_plan(draft_plan)
+                continue
+
+            request_messages = [
+                {"role": "system", "content": TRAVEL_PLANNING_SYSTEM_PROMPT},
+                {"role": "system", "content": TRAVEL_PLANNING_CLARIFICATION_PROMPT}
+            ]
+            request_messages.extend(state["conversation_messages"])
+            try:
+                assistant_text, stats = model_completion_with_stats(request_messages)
+            except Exception as error:
+                print(f"AI: Не удалось получить ответ: {error}")
+                continue
+
+            print_ai_with_stats(assistant_text, stats)
+            state["conversation_messages"].append({"role": "assistant", "content": assistant_text})
+            planning_invariant.register_clarification()
+            continue
+
+        try:
+            draft_plan = generate_planning_draft_plan(state)
+        except Exception as error:
+            print(f"Plan synthesis failed: {error}")
+            continue
+
+        if not draft_plan:
+            print("Не удалось сформировать план. Добавьте правки и попробуйте снова.")
+            continue
+
+        state["draft_plan"] = draft_plan
+        show_draft_plan(draft_plan)
 
 
 def load_strategy(session_id: str) -> int:
