@@ -52,6 +52,42 @@ PERSONALITY_AGENT_SYSTEM_PROMPT_TEMPLATE = (
     "User preferences (style, format, constraints):\n{preferences}\n\n"
     "Follow the profile and preferences strictly in every answer."
 )
+TRAVEL_OUT_OF_SCOPE_MESSAGE = (
+    "Я не эксперт в этой области, вам лучше обратиться в другой чат."
+)
+TRAVEL_CLASSIFIER_SYSTEM_PROMPT = (
+    "Classify whether a user message is about travel only. "
+    "Travel includes trips, routes, countries, cities, transport, flights, trains, "
+    "hotels, visa, insurance, attractions, itineraries, budget, safety, and local tips. "
+    "Return ONLY YES or NO."
+)
+TRAVEL_PLANNING_SYSTEM_PROMPT = (
+    "You are a world-class travel industry expert.\n"
+    "Current stage: Planning.\n"
+    "Your goal is to gather all requirements, ask clarifying questions, and form a clear plan.\n"
+    "If user message is not about travel, respond with exact text and nothing else:\n"
+    f"{TRAVEL_OUT_OF_SCOPE_MESSAGE}\n"
+    "Answer in Russian."
+)
+TRAVEL_PLAN_SYNTHESIS_SYSTEM_PROMPT = (
+    "You are a world-class travel industry expert.\n"
+    "Create a final approved travel research plan from requirements.\n"
+    "Return only the plan in Russian, structured by numbered steps."
+)
+TRAVEL_EXECUTION_SYSTEM_PROMPT = (
+    "You are a world-class travel industry expert.\n"
+    "Current stage: Execution.\n"
+    "Collect information strictly according to approved plan.\n"
+    "Return structured result in Russian with sections by plan steps."
+)
+TRAVEL_VALIDATION_SYSTEM_PROMPT = (
+    "You are a world-class travel industry expert.\n"
+    "Current stage: Validation.\n"
+    "Validate execution data for relevance, consistency, and match with approved plan.\n"
+    "For any item without enough confirmation, append exact warning text:\n"
+    "по данной пункту подтверждений найти не удалось\n"
+    "Return validated structured result in Russian and include useful links."
+)
 SUMMARY_UPDATE_SYSTEM_PROMPT = (
     "You update a running summary of a chat. Keep only facts, decisions, constraints, "
     "user preferences, and unresolved questions. Remove repetition. "
@@ -66,6 +102,7 @@ TOD_LONG_TERM_MEMORY_FILE = TOD_DIR / "long_term_memory.json"
 TOD_LAST_CHAT_FILE = TOD_DIR / "last_chat.txt"
 TOD_CHAT_SENTINEL = "__TOD_CHAT__"
 AGENT_CHAT_SENTINEL = "__PERSONALITY_AGENT_CHAT__"
+AGENT_PLAN_TRAVEL_CHAT_SENTINEL = "__AGENT_PLAN_TRAVEL_CHAT__"
 
 
 client = OpenAI(
@@ -553,6 +590,251 @@ def run_personality_agent_chat() -> str:
         short_term_messages.append({"role": "assistant", "content": assistant_text})
 
 
+def model_completion_with_stats(request_messages: list[dict]) -> tuple[str, dict]:
+    started_at = time.perf_counter()
+    response = client.chat.completions.create(
+        model="openai/gpt-5.2",
+        messages=request_messages,
+    )
+    elapsed_seconds = time.perf_counter() - started_at
+
+    assistant_text = response.choices[0].message.content or ""
+    usage = response.usage
+
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+    total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
+
+    input_cost = (prompt_tokens / 1_000_000) * INPUT_PRICE_PER_1M
+    output_cost = (completion_tokens / 1_000_000) * OUTPUT_PRICE_PER_1M
+    total_cost = input_cost + output_cost
+
+    stats = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "elapsed_seconds": elapsed_seconds,
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total_cost": total_cost,
+    }
+    return assistant_text, stats
+
+
+def print_ai_with_stats(assistant_text: str, stats: dict) -> None:
+    print(f"AI: {assistant_text}")
+    print(f"Prompt tokens: {stats['prompt_tokens']}")
+    print(f"Completion tokens: {stats['completion_tokens']}")
+    print(f"Total tokens: {stats['total_tokens']}")
+    print(f"Response time: {stats['elapsed_seconds']:.2f} sec")
+    print(f"Input cost: {stats['input_cost']:.6f} {CURRENCY}")
+    print(f"Output cost: {stats['output_cost']:.6f} {CURRENCY}")
+    print(f"Total cost: {stats['total_cost']:.6f} {CURRENCY}")
+
+
+def is_travel_related_query(user_input: str) -> bool:
+    request_messages = [
+        {"role": "system", "content": TRAVEL_CLASSIFIER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_input},
+    ]
+    try:
+        result, _stats = model_completion_with_stats(request_messages)
+    except Exception:
+        return True
+
+    normalized = result.strip().upper()
+    if normalized.startswith("NO"):
+        return False
+    if normalized.startswith("YES"):
+        return True
+    return True
+
+
+def new_travel_plan_state() -> dict:
+    return {
+        "stage": "planning",
+        "planning_notes": [],
+        "approved_plan": "",
+        "execution_output": "",
+        "validation_output": "",
+        "conversation_messages": [],
+    }
+
+
+def synthesize_travel_plan(planning_notes: list[str], conversation_messages: list[dict]) -> str:
+    notes_text = "\n".join(f"- {note}" for note in planning_notes) if planning_notes else "- (empty)"
+    convo_text = []
+    for item in conversation_messages[-20:]:
+        role = item.get("role", "")
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        speaker = "User" if role == "user" else "Assistant"
+        convo_text.append(f"{speaker}: {content}")
+    convo_block = "\n".join(convo_text) if convo_text else "(empty)"
+
+    request_messages = [
+        {"role": "system", "content": TRAVEL_PLAN_SYNTHESIS_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Requirements:\n{notes_text}\n\n"
+                f"Conversation context:\n{convo_block}\n\n"
+                "Create the final approved plan."
+            ),
+        },
+    ]
+
+    plan_text, _stats = model_completion_with_stats(request_messages)
+    return plan_text.strip()
+
+
+def run_travel_execution(plan_text: str, planning_notes: list[str]) -> str:
+    notes_text = "\n".join(f"- {note}" for note in planning_notes) if planning_notes else "- (empty)"
+    request_messages = [
+        {"role": "system", "content": TRAVEL_EXECUTION_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Approved plan:\n{plan_text}\n\n"
+                f"Collected requirements:\n{notes_text}\n\n"
+                "Execute plan and collect information."
+            ),
+        },
+    ]
+    text, _stats = model_completion_with_stats(request_messages)
+    return text.strip()
+
+
+def run_travel_validation(plan_text: str, execution_output: str) -> str:
+    request_messages = [
+        {"role": "system", "content": TRAVEL_VALIDATION_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Approved plan:\n{plan_text}\n\n"
+                f"Execution output:\n{execution_output}\n\n"
+                "Validate and return final validated output."
+            ),
+        },
+    ]
+    text, _stats = model_completion_with_stats(request_messages)
+    validated = text.strip()
+
+    if "http://" not in validated and "https://" not in validated:
+        validated += (
+            "\n\nСсылки:\n"
+            "- https://www.iatatravelcentre.com\n"
+            "- https://www.rome2rio.com\n"
+            "- https://www.tripadvisor.com"
+        )
+    return validated
+
+
+def run_travel_plan_chat() -> str:
+    state = new_travel_plan_state()
+
+    print(
+        "\nAgent with Plan Mode, for travel started. "
+        "Pipeline: Planning -> Execution -> Validation -> Done."
+    )
+    print("Type '/approve_plan' to move from Planning to Execution.")
+    print("Type '/switch' to return session menu, or 'exit' to quit program.")
+
+    while True:
+        if state["stage"] == "execution":
+            print("\nStage: Execution")
+            try:
+                state["execution_output"] = run_travel_execution(
+                    state["approved_plan"],
+                    state["planning_notes"],
+                )
+            except Exception as error:
+                print(f"Execution failed: {error}")
+                state["stage"] = "planning"
+                continue
+            state["stage"] = "validation"
+            continue
+
+        if state["stage"] == "validation":
+            print("\nStage: Validation")
+            try:
+                state["validation_output"] = run_travel_validation(
+                    state["approved_plan"],
+                    state["execution_output"],
+                )
+            except Exception as error:
+                print(f"Validation failed: {error}")
+                state["stage"] = "planning"
+                continue
+            state["stage"] = "done"
+            continue
+
+        if state["stage"] == "done":
+            print("\nStage: Done")
+            print(state["validation_output"])
+            print("\nDone. You can start a new travel request.")
+            state = new_travel_plan_state()
+            continue
+
+        user_input = input("You: ").strip()
+
+        if user_input.lower() in {"exit", "quit"}:
+            print("Bye!")
+            return "exit"
+
+        if user_input.lower() == "/switch":
+            print("Returning to session menu...")
+            return "switch"
+
+        if user_input.lower() == "/approve_plan":
+            if not state["planning_notes"]:
+                print("Сначала опишите требования к путешествию, затем утвердите план.")
+                continue
+            try:
+                approved_plan = synthesize_travel_plan(
+                    state["planning_notes"],
+                    state["conversation_messages"],
+                )
+            except Exception as error:
+                print(f"Plan synthesis failed: {error}")
+                continue
+
+            if not approved_plan:
+                print("Не удалось сформировать план. Добавьте уточнения и попробуйте снова.")
+                continue
+
+            state["approved_plan"] = approved_plan
+            print("\nApproved plan:")
+            print(approved_plan)
+            print("\nPlan approved. Moving to Execution...")
+            state["stage"] = "execution"
+            continue
+
+        if not user_input:
+            continue
+
+        if not is_travel_related_query(user_input):
+            print(f"AI: {TRAVEL_OUT_OF_SCOPE_MESSAGE}")
+            continue
+
+        request_messages = [{"role": "system", "content": TRAVEL_PLANNING_SYSTEM_PROMPT}]
+        request_messages.extend(state["conversation_messages"])
+        request_messages.append({"role": "user", "content": user_input})
+
+        try:
+            assistant_text, stats = model_completion_with_stats(request_messages)
+        except Exception as error:
+            print(f"AI: Не удалось получить ответ: {error}")
+            continue
+
+        print_ai_with_stats(assistant_text, stats)
+
+        state["planning_notes"].append(user_input)
+        state["conversation_messages"].append({"role": "user", "content": user_input})
+        state["conversation_messages"].append({"role": "assistant", "content": assistant_text})
+
+
 def load_strategy(session_id: str) -> int:
     path = strategy_path(session_id)
     if not path.exists():
@@ -874,7 +1156,7 @@ def choose_session() -> tuple[str, list[dict]]:
     last_session_id = read_last_session_id()
 
     while True:
-        print("\nChoose chat session:")
+        print("\nChoose variant for chat session (it's base variant for chating):")
         option_map = {}
         option = 1
 
@@ -890,16 +1172,21 @@ def choose_session() -> tuple[str, list[dict]]:
         print(f"{option}) New session")
         option_map[str(option)] = "new"
 
-        print("\nСhat with Tod chef cooking")
-        print("Type Tod to open this chat.")
-        print("\nCreate personality agent")
-        print("Type agent to open this chat.")
+        print("- - -")
+        print("Сhat with Tod chef cooking (type Tod to open this chat).")
+        print("- - -")
+        print("Create personality agent (type agent to starting this chat).")
+        print("- - -")
+        print("Agent with Plan Mode, for travel (type \"agent with plan\" to starting this chat)")
+        print("- - -")
 
         choice = input("Select option: ").strip()
         if choice.lower() == "tod":
             return TOD_CHAT_SENTINEL, []
         if choice.lower() == "agent":
             return AGENT_CHAT_SENTINEL, []
+        if choice.lower() == "agent with plan":
+            return AGENT_PLAN_TRAVEL_CHAT_SENTINEL, []
         action = option_map.get(choice)
 
         if action == "continue_last" and last_session_id:
@@ -962,6 +1249,12 @@ while True:
     if current_session_id == AGENT_CHAT_SENTINEL:
         agent_result = run_personality_agent_chat()
         if agent_result == "exit":
+            break
+        continue
+
+    if current_session_id == AGENT_PLAN_TRAVEL_CHAT_SENTINEL:
+        travel_result = run_travel_plan_chat()
+        if travel_result == "exit":
             break
         continue
 
