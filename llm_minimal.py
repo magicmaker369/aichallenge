@@ -784,7 +784,30 @@ def run_travel_plan_chat() -> str:
                 print(f"Validation failed: {error}")
                 state["stage"] = "planning"
                 continue
-            state["stage"] = "done"
+            print("Сбор информации подготовлен, мне выводить информацию?")
+            state["stage"] = "awaiting_done_confirmation"
+            continue
+
+        if state["stage"] == "awaiting_done_confirmation":
+            user_input = input("You: ").strip()
+
+            if user_input.lower() in {"exit", "quit"}:
+                print("Bye!")
+                return "exit"
+
+            if user_input.lower() == "/switch":
+                print("Returning to session menu...")
+                return "switch"
+
+            if user_input.lower() == "yes":
+                state["stage"] = "done"
+                continue
+
+            if user_input.lower() == "no":
+                state["stage"] = "planning"
+                continue
+
+            print("Введите Yes или No.")
             continue
 
         if state["stage"] == "done":
