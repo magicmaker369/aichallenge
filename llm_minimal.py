@@ -1,10 +1,14 @@
+import asyncio
 import json
+import re
+import sys
 from datetime import datetime
 from pathlib import Path
 import time
 from typing import Optional
 
 from openai import OpenAI
+from vkusvill_mcp_chat import VKUSVILL_CHAT_SENTINEL, run_vkusvill_mcp_chat
 
 YOUR_API_KEY = ""
 # Set your actual prices from routerai.ru.
@@ -89,6 +93,32 @@ SUMMARY_UPDATE_SYSTEM_PROMPT = (
     "user preferences, and unresolved questions. Remove repetition. "
     "Write concise plain text in Russian. Return only the updated summary."
 )
+WEATHER_DEFAULT_CLARIFICATION = (
+    "Уточните, для какого города или населённого пункта нужна погода."
+)
+WEATHER_INTENT_SYSTEM_PROMPT = (
+    "You convert weather questions into strict JSON.\n"
+    "Return only one JSON object with keys: action, location, days, clarification.\n"
+    "Rules:\n"
+    "- action must be 'clarify' or 'lookup'\n"
+    "- days must be integer from 1 to 3\n"
+    "- use 1 for current weather/today, 2 for tomorrow, 3 for day after tomorrow or 3-day forecast\n"
+    "- use recent weather chat context if user refers to previous location with short follow-up\n"
+    "- if the request is missing a usable location, set action='clarify'\n"
+    "- clarification must be a short Russian question\n"
+    "- for lookup, location must be a plain string without commentary\n"
+    "Do not add markdown or text outside JSON."
+)
+WEATHER_RESPONSE_SYSTEM_PROMPT = (
+    "You are a weather assistant.\n"
+    "Answer in Russian.\n"
+    "Use only the provided tool JSON, do not invent facts.\n"
+    "If status is ambiguous_location, ask the user to choose one of the candidates.\n"
+    "If status is not_found, ask the user to specify another location.\n"
+    "If status is upstream_error, explain the failure briefly and suggest trying again.\n"
+    "If status is ok, summarize the current weather and available forecast briefly.\n"
+    "No markdown tables."
+)
 
 HISTORY_DIR = Path("history")
 LAST_SESSION_FILE = HISTORY_DIR / "last_session.txt"
@@ -99,6 +129,7 @@ TOD_LAST_CHAT_FILE = TOD_DIR / "last_chat.txt"
 TOD_CHAT_SENTINEL = "__TOD_CHAT__"
 AGENT_CHAT_SENTINEL = "__PERSONALITY_AGENT_CHAT__"
 AGENT_PLAN_TRAVEL_CHAT_SENTINEL = "__AGENT_PLAN_TRAVEL_CHAT__"
+AGENT_WEATHER_MCP_CHAT_SENTINEL = "__AGENT_WEATHER_MCP_CHAT__"
 
 
 client = OpenAI(
@@ -628,6 +659,404 @@ def print_ai_with_stats(assistant_text: str, stats: dict) -> None:
     print(f"Total cost: {stats['total_cost']:.6f} {CURRENCY}")
 
 
+def empty_completion_stats() -> dict:
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "elapsed_seconds": 0.0,
+        "input_cost": 0.0,
+        "output_cost": 0.0,
+        "total_cost": 0.0,
+    }
+
+
+def merge_completion_stats(stats_items: list[dict], elapsed_seconds: Optional[float] = None) -> dict:
+    merged = empty_completion_stats()
+    for item in stats_items:
+        if not item:
+            continue
+        merged["prompt_tokens"] += int(item.get("prompt_tokens", 0))
+        merged["completion_tokens"] += int(item.get("completion_tokens", 0))
+        merged["total_tokens"] += int(item.get("total_tokens", 0))
+        merged["elapsed_seconds"] += float(item.get("elapsed_seconds", 0.0))
+        merged["input_cost"] += float(item.get("input_cost", 0.0))
+        merged["output_cost"] += float(item.get("output_cost", 0.0))
+        merged["total_cost"] += float(item.get("total_cost", 0.0))
+
+    if elapsed_seconds is not None:
+        merged["elapsed_seconds"] = elapsed_seconds
+    return merged
+
+
+def parse_json_object(raw_text: str) -> Optional[dict]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def new_weather_chat_state() -> dict:
+    return {
+        "messages": [],
+        "last_resolved_location": "",
+        "last_tool_status": "",
+        "last_candidates": [],
+    }
+
+
+def append_weather_message(state: dict, role: str, content: str, limit: int = 8) -> None:
+    state["messages"].append({"role": role, "content": content})
+    if len(state["messages"]) > limit:
+        state["messages"] = state["messages"][-limit:]
+
+
+def weather_memory_text(state: dict) -> str:
+    lines = []
+
+    last_resolved_location = str(state.get("last_resolved_location", "")).strip()
+    if last_resolved_location:
+        lines.append(f"- Last resolved location: {last_resolved_location}")
+
+    last_tool_status = str(state.get("last_tool_status", "")).strip()
+    if last_tool_status:
+        lines.append(f"- Last tool status: {last_tool_status}")
+
+    last_candidates = state.get("last_candidates", [])
+    if isinstance(last_candidates, list) and last_candidates:
+        lines.append("- Recent ambiguous candidates:")
+        for idx, label in enumerate(last_candidates, start=1):
+            cleaned = str(label).strip()
+            if cleaned:
+                lines.append(f"  {idx}. {cleaned}")
+
+    if not lines:
+        return "(empty)"
+    return "\n".join(lines)
+
+
+def build_weather_intent_messages(state: dict, user_input: str) -> list[dict]:
+    history_lines = []
+    for item in state.get("messages", [])[-6:]:
+        role = item.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        prefix = "User" if role == "user" else "Assistant"
+        history_lines.append(f"{prefix}: {content}")
+
+    history_text = "\n".join(history_lines) if history_lines else "(empty)"
+    memory_text = weather_memory_text(state)
+    current_date = datetime.now().strftime("%Y-%m-%d")
+
+    return [
+        {"role": "system", "content": WEATHER_INTENT_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Today: {current_date}\n\n"
+                f"Recent weather chat:\n{history_text}\n\n"
+                f"Weather memory:\n{memory_text}\n\n"
+                f"Latest user message:\n{user_input}\n\n"
+                "Return JSON only."
+            ),
+        },
+    ]
+
+
+def normalize_weather_intent(payload: dict) -> dict:
+    action = str(payload.get("action", "")).strip().lower()
+    location = payload.get("location")
+    clarification = payload.get("clarification")
+
+    try:
+        days = int(payload.get("days", 1))
+    except (TypeError, ValueError):
+        days = 1
+
+    days = max(1, min(3, days))
+
+    if isinstance(location, str):
+        location = location.strip() or None
+    else:
+        location = None
+
+    if isinstance(clarification, str):
+        clarification = clarification.strip() or None
+    else:
+        clarification = None
+
+    if action not in {"clarify", "lookup"}:
+        action = "clarify"
+
+    if action == "lookup" and not location:
+        action = "clarify"
+        clarification = clarification or WEATHER_DEFAULT_CLARIFICATION
+
+    if action == "clarify":
+        clarification = clarification or WEATHER_DEFAULT_CLARIFICATION
+
+    return {
+        "action": action,
+        "location": location,
+        "days": days,
+        "clarification": clarification,
+    }
+
+
+def extract_weather_intent(state: dict, user_input: str) -> tuple[dict, dict]:
+    request_messages = build_weather_intent_messages(state, user_input)
+    assistant_text, stats = model_completion_with_stats(request_messages)
+    payload = parse_json_object(assistant_text)
+    if payload is None:
+        return (
+            {
+                "action": "clarify",
+                "location": None,
+                "days": 1,
+                "clarification": WEATHER_DEFAULT_CLARIFICATION,
+            },
+            stats,
+        )
+    return normalize_weather_intent(payload), stats
+
+
+def fallback_weather_response(tool_payload: dict) -> str:
+    status = str(tool_payload.get("status", "")).strip()
+    message = str(tool_payload.get("message", "")).strip()
+
+    if status == "ambiguous_location":
+        labels = []
+        for item in tool_payload.get("candidates", []):
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "")).strip()
+            if label:
+                labels.append(label)
+        if labels:
+            return "Нужно уточнить локацию. Подходящие варианты: " + "; ".join(labels) + "."
+        return message or WEATHER_DEFAULT_CLARIFICATION
+
+    if status == "not_found":
+        return message or "Не удалось найти такую локацию. Уточните запрос."
+
+    if status == "upstream_error":
+        return message or "Не удалось получить данные о погоде. Попробуйте ещё раз."
+
+    resolved_location = tool_payload.get("resolved_location")
+    current = tool_payload.get("current")
+    daily = tool_payload.get("daily", [])
+    timezone = str(tool_payload.get("timezone", "")).strip()
+
+    label = "указанной локации"
+    if isinstance(resolved_location, dict):
+        resolved_label = str(resolved_location.get("label", "")).strip()
+        if resolved_label:
+            label = resolved_label
+
+    parts = [f"Погода для {label}."]
+
+    if isinstance(current, dict):
+        temperature = current.get("temperature_c")
+        apparent = current.get("apparent_temperature_c")
+        description = str(current.get("weather_description", "")).strip()
+        wind_speed = current.get("wind_speed_kmh")
+
+        current_parts = []
+        if temperature is not None:
+            current_parts.append(f"Сейчас {temperature}°C")
+        if description:
+            current_parts.append(description)
+        if apparent is not None:
+            current_parts.append(f"ощущается как {apparent}°C")
+        if wind_speed is not None:
+            current_parts.append(f"ветер {wind_speed} км/ч")
+        if current_parts:
+            parts.append(", ".join(current_parts) + ".")
+
+    if isinstance(daily, list) and daily:
+        daily_lines = []
+        for item in daily:
+            if not isinstance(item, dict):
+                continue
+            date = str(item.get("date", "")).strip()
+            minimum = item.get("temperature_min_c")
+            maximum = item.get("temperature_max_c")
+            description = str(item.get("weather_description", "")).strip()
+            precipitation = item.get("precipitation_sum_mm")
+
+            line_parts = []
+            if date:
+                line_parts.append(date)
+            if minimum is not None and maximum is not None:
+                line_parts.append(f"{minimum}..{maximum}°C")
+            if description:
+                line_parts.append(description)
+            if precipitation is not None:
+                line_parts.append(f"осадки {precipitation} мм")
+            if line_parts:
+                daily_lines.append(", ".join(line_parts))
+        if daily_lines:
+            parts.append("Прогноз: " + "; ".join(daily_lines) + ".")
+
+    if timezone:
+        parts.append(f"Часовой пояс: {timezone}.")
+
+    return " ".join(parts).strip()
+
+
+def summarize_weather_tool_result(user_input: str, tool_payload: dict) -> tuple[str, dict]:
+    request_messages = [
+        {"role": "system", "content": WEATHER_RESPONSE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Original user message:\n{user_input}\n\n"
+                f"Tool JSON:\n{json.dumps(tool_payload, ensure_ascii=False, indent=2)}\n\n"
+                "Write a concise Russian answer."
+            ),
+        },
+    ]
+
+    try:
+        assistant_text, stats = model_completion_with_stats(request_messages)
+    except Exception:
+        return fallback_weather_response(tool_payload), empty_completion_stats()
+
+    assistant_text = assistant_text.strip()
+    if not assistant_text:
+        return fallback_weather_response(tool_payload), stats
+    return assistant_text, stats
+
+
+def weather_server_path() -> Path:
+    return Path(__file__).with_name("weather_mcp_server.py").resolve()
+
+
+def weather_mcp_availability_error() -> Optional[str]:
+    if sys.version_info < (3, 10):
+        return "Weather MCP mode requires Python 3.10+."
+
+    server_path = weather_server_path()
+    if not server_path.exists():
+        return f"Weather MCP server file is missing: {server_path}"
+
+    try:
+        from mcp import ClientSession, StdioServerParameters  # noqa: F401
+        from mcp.client.stdio import stdio_client  # noqa: F401
+    except ImportError:
+        return "Weather MCP mode requires the `mcp` package. Install dependencies from README."
+
+    return None
+
+
+async def _call_weather_tool_via_mcp(location: str, days: int) -> dict:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=[str(weather_server_path())],
+    )
+
+    async with stdio_client(server_params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            tool_result = await session.call_tool(
+                "get_weather",
+                arguments={"location": location, "days": days},
+            )
+
+    structured = getattr(tool_result, "structuredContent", None)
+    if isinstance(structured, dict):
+        return structured
+
+    for item in getattr(tool_result, "content", []) or []:
+        text = ""
+        if isinstance(item, dict):
+            text = str(item.get("text", "")).strip()
+        else:
+            text = str(getattr(item, "text", "")).strip()
+
+        if not text:
+            continue
+
+        payload = parse_json_object(text)
+        if payload is not None:
+            return payload
+
+    return {
+        "status": "upstream_error",
+        "resolved_location": None,
+        "timezone": None,
+        "current": None,
+        "daily": [],
+        "candidates": [],
+        "message": "MCP tool returned an unreadable payload.",
+    }
+
+
+def call_weather_tool_via_mcp(location: str, days: int) -> tuple[dict, float]:
+    started_at = time.perf_counter()
+    try:
+        payload = asyncio.run(_call_weather_tool_via_mcp(location, days))
+    except Exception as error:
+        payload = {
+            "status": "upstream_error",
+            "resolved_location": None,
+            "timezone": None,
+            "current": None,
+            "daily": [],
+            "candidates": [],
+            "message": f"Weather MCP call failed: {error}",
+        }
+    elapsed_seconds = time.perf_counter() - started_at
+    return payload, elapsed_seconds
+
+
+def update_weather_state_from_tool(state: dict, tool_payload: dict) -> None:
+    status = str(tool_payload.get("status", "")).strip()
+    state["last_tool_status"] = status
+
+    if status == "ok":
+        resolved_location = tool_payload.get("resolved_location")
+        if isinstance(resolved_location, dict):
+            label = str(resolved_location.get("label", "")).strip()
+            if label:
+                state["last_resolved_location"] = label
+        state["last_candidates"] = []
+        return
+
+    if status == "ambiguous_location":
+        labels = []
+        for item in tool_payload.get("candidates", []):
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "")).strip()
+            if label:
+                labels.append(label)
+        state["last_candidates"] = labels
+        return
+
+    state["last_candidates"] = []
+
+
 class invariant:
     def __init__(self, max_clarifications: int = 2):
         self.max_clarifications = max_clarifications
@@ -891,6 +1320,70 @@ def run_travel_plan_chat() -> str:
 
         state["draft_plan"] = draft_plan
         show_draft_plan(draft_plan)
+
+
+def run_weather_mcp_chat() -> str:
+    availability_error = weather_mcp_availability_error()
+    if availability_error:
+        print(f"\nWeather via MCP is unavailable: {availability_error}")
+        return "switch"
+
+    state = new_weather_chat_state()
+    print(
+        "\nWeather via MCP chat started. "
+        "Type 'exit' to quit program or '/switch' to return session menu."
+    )
+
+    while True:
+        user_input = input("You: ").strip()
+
+        if user_input.lower() in {"exit", "quit"}:
+            print("Bye!")
+            return "exit"
+
+        if user_input.lower() == "/switch":
+            print("Returning to session menu...")
+            return "switch"
+
+        if not user_input:
+            continue
+
+        total_started_at = time.perf_counter()
+
+        try:
+            weather_intent, intent_stats = extract_weather_intent(state, user_input)
+        except Exception as error:
+            print(f"AI: Не удалось обработать запрос о погоде: {error}")
+            continue
+
+        if weather_intent["action"] == "clarify":
+            assistant_text = weather_intent["clarification"]
+            total_stats = merge_completion_stats(
+                [intent_stats],
+                elapsed_seconds=time.perf_counter() - total_started_at,
+            )
+            print_ai_with_stats(assistant_text, total_stats)
+            append_weather_message(state, "user", user_input)
+            append_weather_message(state, "assistant", assistant_text)
+            state["last_tool_status"] = "clarify"
+            continue
+
+        tool_payload, tool_elapsed_seconds = call_weather_tool_via_mcp(
+            weather_intent["location"],
+            weather_intent["days"],
+        )
+        update_weather_state_from_tool(state, tool_payload)
+        assistant_text, answer_stats = summarize_weather_tool_result(user_input, tool_payload)
+
+        total_stats = merge_completion_stats(
+            [intent_stats, answer_stats],
+            elapsed_seconds=time.perf_counter() - total_started_at,
+        )
+        print_ai_with_stats(assistant_text, total_stats)
+        print(f"MCP tool time: {tool_elapsed_seconds:.2f} sec")
+
+        append_weather_message(state, "user", user_input)
+        append_weather_message(state, "assistant", assistant_text)
 
 
 def load_strategy(session_id: str) -> int:
@@ -1237,6 +1730,10 @@ def choose_session() -> tuple[str, list[dict]]:
         print("- - -")
         print("Agent with Plan Mode, for travel (type \"agent with plan\" to starting this chat)")
         print("- - -")
+        print("Weather via MCP (type \"weather mcp\" to starting this chat)")
+        print("- - -")
+        print("VkusVill via MCP (type \"vkusvill mcp\" to starting this chat)")
+        print("- - -")
 
         choice = input("Select option: ").strip()
         if choice.lower() == "tod":
@@ -1245,6 +1742,10 @@ def choose_session() -> tuple[str, list[dict]]:
             return AGENT_CHAT_SENTINEL, []
         if choice.lower() == "agent with plan":
             return AGENT_PLAN_TRAVEL_CHAT_SENTINEL, []
+        if choice.lower() == "weather mcp":
+            return AGENT_WEATHER_MCP_CHAT_SENTINEL, []
+        if choice.lower() == "vkusvill mcp":
+            return VKUSVILL_CHAT_SENTINEL, []
         action = option_map.get(choice)
 
         if action == "continue_last" and last_session_id:
@@ -1313,6 +1814,23 @@ while True:
     if current_session_id == AGENT_PLAN_TRAVEL_CHAT_SENTINEL:
         travel_result = run_travel_plan_chat()
         if travel_result == "exit":
+            break
+        continue
+
+    if current_session_id == AGENT_WEATHER_MCP_CHAT_SENTINEL:
+        weather_result = run_weather_mcp_chat()
+        if weather_result == "exit":
+            break
+        continue
+
+    if current_session_id == VKUSVILL_CHAT_SENTINEL:
+        vkusvill_result = run_vkusvill_mcp_chat(
+            model_completion_with_stats,
+            print_ai_with_stats,
+            empty_completion_stats,
+            merge_completion_stats,
+        )
+        if vkusvill_result == "exit":
             break
         continue
 
