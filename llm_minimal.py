@@ -1,14 +1,15 @@
 import asyncio
+import ast
 import json
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from openai import OpenAI
-from vkusvill_mcp_chat import VKUSVILL_CHAT_SENTINEL, run_vkusvill_mcp_chat
+from vkusvill_mcp_chat import VKUSVILL_CHAT_SENTINEL, run_vkusvill_mcp_chat, to_plain_data
 
 YOUR_API_KEY = ""
 # Set your actual prices from routerai.ru.
@@ -710,6 +711,69 @@ def parse_json_object(raw_text: str) -> Optional[dict]:
     return None
 
 
+WEATHER_PAYLOAD_KEYS = {
+    "status",
+    "resolved_location",
+    "timezone",
+    "current",
+    "daily",
+    "candidates",
+    "message",
+}
+
+
+def parse_relaxed_dict_text(raw_text: str) -> Optional[dict]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+
+    try:
+        payload = ast.literal_eval(text)
+    except (SyntaxError, ValueError):
+        return None
+
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def normalize_weather_payload(value: Any) -> Optional[dict]:
+    plain = to_plain_data(value)
+
+    if isinstance(plain, dict):
+        if WEATHER_PAYLOAD_KEYS.intersection(plain.keys()):
+            return plain
+
+        text_value = plain.get("text")
+        if isinstance(text_value, str):
+            normalized = normalize_weather_payload(text_value)
+            if normalized is not None:
+                return normalized
+
+        for key in ("result", "data", "payload", "structuredContent", "structured_content"):
+            nested = plain.get(key)
+            normalized = normalize_weather_payload(nested)
+            if normalized is not None:
+                return normalized
+
+    if isinstance(plain, list):
+        for item in plain:
+            normalized = normalize_weather_payload(item)
+            if normalized is not None:
+                return normalized
+        return None
+
+    if isinstance(plain, str):
+        payload = parse_json_object(plain)
+        if payload is None:
+            payload = parse_relaxed_dict_text(plain)
+        if payload is None:
+            return None
+        return normalize_weather_payload(payload)
+
+    return None
+
+
 def new_weather_chat_state() -> dict:
     return {
         "messages": [],
@@ -820,20 +884,204 @@ def normalize_weather_intent(payload: dict) -> dict:
     }
 
 
+def normalize_weather_match_text(value: str) -> str:
+    normalized = str(value or "").lower().replace("ё", "е")
+    normalized = re.sub(r"[^a-zа-я0-9]+", " ", normalized)
+    return " ".join(normalized.split())
+
+
+def clean_weather_location_candidate(value: str) -> Optional[str]:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return None
+
+    cleaned = re.sub(
+        r"^(?:покажи|скажи|расскажи|дай|хочу\s+узнать|узнай)\s+"
+        r"(?:мне\s+)?(?:какая\s+)?(?:сейчас\s+)?(?:погода|прогноз(?:\s+погоды)?)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^(?:какая\s+)?(?:сейчас\s+)?(?:погода|прогноз(?:\s+погоды)?)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"^(?:в|во|для|по)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\s+(?:на\s+)?(?:сегодня|завтра|послезавтра|сейчас)\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s+(?:на\s+)?(?:[123]|один|два|три)\s+дн(?:я|ей)\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\r\n.,!?;:\"'«»()[]")
+    if not cleaned:
+        return None
+
+    normalized = normalize_weather_match_text(cleaned)
+    if re.fullmatch(r"(?:вариант\s+)?[1-5]", normalized):
+        return None
+    if re.fullmatch(r"(?:а\s+)?(?:на\s+)?(?:сегодня|завтра|послезавтра|сейчас)", normalized):
+        return None
+    if normalized in {
+        "",
+        "pogoda",
+        "weather",
+        "а сегодня",
+        "а завтра",
+        "а послезавтра",
+        "на сегодня",
+        "на завтра",
+        "на послезавтра",
+        "сегодня",
+        "завтра",
+        "послезавтра",
+        "сейчас",
+        "погода",
+        "прогноз",
+        "прогноз погоды",
+    }:
+        return None
+    return cleaned
+
+
+def weather_days_from_text(user_input: str) -> int:
+    normalized = normalize_weather_match_text(user_input)
+
+    if "послезавтра" in normalized or "через два дня" in normalized:
+        return 3
+    if re.search(r"\b(?:3|три)\s+дн(?:я|ей)\b", normalized):
+        return 3
+    if "завтра" in normalized:
+        return 2
+    if re.search(r"\b(?:2|два)\s+дн(?:я|ей)\b", normalized):
+        return 2
+    return 1
+
+
+def resolve_weather_candidate_selection(state: dict, user_input: str) -> Optional[str]:
+    raw_candidates = state.get("last_candidates", [])
+    candidates = [str(item).strip() for item in raw_candidates if str(item).strip()]
+    if not candidates:
+        return None
+
+    normalized_input = normalize_weather_match_text(user_input)
+    if not normalized_input:
+        return None
+
+    ordinal_map = {
+        "первый": 1,
+        "первая": 1,
+        "первое": 1,
+        "второй": 2,
+        "вторая": 2,
+        "второе": 2,
+        "третий": 3,
+        "третья": 3,
+        "третье": 3,
+        "четвертый": 4,
+        "четвёртый": 4,
+        "четвертая": 4,
+        "четвёртая": 4,
+        "пятый": 5,
+        "пятая": 5,
+    }
+
+    index_match = re.fullmatch(r"(?:вариант\s+)?([1-5])", normalized_input)
+    if index_match:
+        index = int(index_match.group(1)) - 1
+        if 0 <= index < len(candidates):
+            return candidates[index]
+
+    for word, position in ordinal_map.items():
+        if normalized_input in {word, f"вариант {word}"}:
+            index = position - 1
+            if 0 <= index < len(candidates):
+                return candidates[index]
+
+    for candidate in candidates:
+        normalized_candidate = normalize_weather_match_text(candidate)
+        if normalized_input == normalized_candidate:
+            return candidate
+        if normalized_input and normalized_input in normalized_candidate:
+            return candidate
+
+    return None
+
+
+def extract_weather_location_from_text(state: dict, user_input: str) -> Optional[str]:
+    selected_candidate = resolve_weather_candidate_selection(state, user_input)
+    if selected_candidate:
+        return selected_candidate
+
+    normalized_input = normalize_weather_match_text(user_input)
+    patterns = [
+        r"\b(?:в|во|для|по)\s+(.+?)(?=(?:\s+(?:на\s+)?(?:сегодня|завтра|послезавтра|сейчас)\b|\s+(?:на\s+)?(?:[123]|один|два|три)\s+дн(?:я|ей)\b|[?!.]|$))",
+        r"^(?:какая\s+)?(?:сейчас\s+)?(?:погода|прогноз(?:\s+погоды)?)\s+(.+?)(?=(?:\s+(?:на\s+)?(?:сегодня|завтра|послезавтра|сейчас)\b|\s+(?:на\s+)?(?:[123]|один|два|три)\s+дн(?:я|ей)\b|[?!.]|$))",
+        r"^(?:покажи|скажи|расскажи|дай|хочу\s+узнать|узнай)\s+(?:мне\s+)?(?:какая\s+)?(?:сейчас\s+)?(?:погода|прогноз(?:\s+погоды)?)\s+(.+?)(?=(?:\s+(?:на\s+)?(?:сегодня|завтра|послезавтра|сейчас)\b|\s+(?:на\s+)?(?:[123]|один|два|три)\s+дн(?:я|ей)\b|[?!.]|$))",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, user_input, flags=re.IGNORECASE)
+        if not match:
+            continue
+        location = clean_weather_location_candidate(match.group(1))
+        if location:
+            return location
+
+    last_resolved_location = str(state.get("last_resolved_location", "")).strip()
+    if (
+        last_resolved_location
+        and normalized_input
+        and any(
+            marker in normalized_input
+            for marker in ("сегодня", "завтра", "послезавтра", "сейчас", "погода", "прогноз", "там", "тут", "здесь")
+        )
+    ):
+        return last_resolved_location
+
+    location = clean_weather_location_candidate(user_input)
+    if location:
+        return location
+
+    return None
+
+
+def fallback_weather_intent(state: dict, user_input: str) -> dict:
+    location = extract_weather_location_from_text(state, user_input)
+    if not location:
+        return {
+            "action": "clarify",
+            "location": None,
+            "days": 1,
+            "clarification": WEATHER_DEFAULT_CLARIFICATION,
+        }
+
+    return {
+        "action": "lookup",
+        "location": location,
+        "days": weather_days_from_text(user_input),
+        "clarification": WEATHER_DEFAULT_CLARIFICATION,
+    }
+
+
 def extract_weather_intent(state: dict, user_input: str) -> tuple[dict, dict]:
     request_messages = build_weather_intent_messages(state, user_input)
-    assistant_text, stats = model_completion_with_stats(request_messages)
+    try:
+        assistant_text, stats = model_completion_with_stats(request_messages)
+    except Exception:
+        return fallback_weather_intent(state, user_input), empty_completion_stats()
+
     payload = parse_json_object(assistant_text)
     if payload is None:
-        return (
-            {
-                "action": "clarify",
-                "location": None,
-                "days": 1,
-                "clarification": WEATHER_DEFAULT_CLARIFICATION,
-            },
-            stats,
-        )
+        return fallback_weather_intent(state, user_input), stats
     return normalize_weather_intent(payload), stats
 
 
@@ -983,24 +1231,10 @@ async def _call_weather_tool_via_mcp(location: str, days: int) -> dict:
                 arguments={"location": location, "days": days},
             )
 
-    structured = getattr(tool_result, "structuredContent", None)
-    if isinstance(structured, dict):
-        return structured
+    return extract_weather_tool_payload(tool_result)
 
-    for item in getattr(tool_result, "content", []) or []:
-        text = ""
-        if isinstance(item, dict):
-            text = str(item.get("text", "")).strip()
-        else:
-            text = str(getattr(item, "text", "")).strip()
 
-        if not text:
-            continue
-
-        payload = parse_json_object(text)
-        if payload is not None:
-            return payload
-
+def unreadable_weather_payload() -> dict:
     return {
         "status": "upstream_error",
         "resolved_location": None,
@@ -1010,6 +1244,28 @@ async def _call_weather_tool_via_mcp(location: str, days: int) -> dict:
         "candidates": [],
         "message": "MCP tool returned an unreadable payload.",
     }
+
+
+def extract_weather_tool_payload(tool_result: Any) -> dict:
+    structured = getattr(tool_result, "structuredContent", None)
+    if structured is None:
+        structured = getattr(tool_result, "structured_content", None)
+    if structured is not None:
+        normalized = normalize_weather_payload(structured)
+        if normalized is not None:
+            return normalized
+
+    raw_content = getattr(tool_result, "content", None)
+    if raw_content is not None:
+        normalized = normalize_weather_payload(raw_content)
+        if normalized is not None:
+            return normalized
+
+    normalized = normalize_weather_payload(tool_result)
+    if normalized is not None:
+        return normalized
+
+    return unreadable_weather_payload()
 
 
 def call_weather_tool_via_mcp(location: str, days: int) -> tuple[dict, float]:
@@ -1792,192 +2048,197 @@ def choose_session() -> tuple[str, list[dict]]:
         print("Invalid option. Try again.")
 
 
-while True:
-    current_session_id, messages = choose_session()
-
-    if current_session_id == TOD_CHAT_SENTINEL:
-        tod_chat_id = choose_tod_chat()
-        if tod_chat_id is None:
-            continue
-
-        tod_result = run_tod_chat(tod_chat_id)
-        if tod_result == "exit":
-            break
-        continue
-
-    if current_session_id == AGENT_CHAT_SENTINEL:
-        agent_result = run_personality_agent_chat()
-        if agent_result == "exit":
-            break
-        continue
-
-    if current_session_id == AGENT_PLAN_TRAVEL_CHAT_SENTINEL:
-        travel_result = run_travel_plan_chat()
-        if travel_result == "exit":
-            break
-        continue
-
-    if current_session_id == AGENT_WEATHER_MCP_CHAT_SENTINEL:
-        weather_result = run_weather_mcp_chat()
-        if weather_result == "exit":
-            break
-        continue
-
-    if current_session_id == VKUSVILL_CHAT_SENTINEL:
-        vkusvill_result = run_vkusvill_mcp_chat(
-            model_completion_with_stats,
-            print_ai_with_stats,
-            empty_completion_stats,
-            merge_completion_stats,
-        )
-        if vkusvill_result == "exit":
-            break
-        continue
-
-    write_last_session_id(current_session_id)
-    context_strategy = choose_context_strategy(current_session_id)
-    session_metrics = load_metrics(current_session_id)
-    session_summary = load_summary(current_session_id)
-    session_facts = load_facts(current_session_id)
-    if context_strategy == STRATEGY_ROLLING_SUMMARY:
-        session_summary = bootstrap_summary_if_needed(current_session_id, messages, session_summary)
-    elif context_strategy == STRATEGY_SLIDING_WINDOW:
-        messages = trim_messages_for_sliding_window(messages, 2)
-        save_session(current_session_id, messages)
-
-    print_history(messages, DEFAULT_HISTORY_LIMIT)
-    print(
-        f"\nTerminal chat started. Session: {current_session_id}. "
-        f"Strategy: {STRATEGY_LABELS[context_strategy]}. "
-        "Type 'exit' to quit. Use '/switch' to open session menu. "
-        "Use '/history all' to print full history. Use '/summary' for session stats."
-    )
-
-    switch_requested = False
-
+def main() -> None:
     while True:
-        user_input = input("You: ").strip()
+        current_session_id, messages = choose_session()
 
-        if user_input.lower() in {"exit", "quit"}:
-            print("Bye!")
-            break
+        if current_session_id == TOD_CHAT_SENTINEL:
+            tod_chat_id = choose_tod_chat()
+            if tod_chat_id is None:
+                continue
 
-        if user_input.lower() == "/switch":
-            print("Returning to session menu...")
-            switch_requested = True
-            break
-
-        if user_input.lower() == "/history all":
-            print_history(messages, limit=None)
+            tod_result = run_tod_chat(tod_chat_id)
+            if tod_result == "exit":
+                break
             continue
 
-        if user_input.lower() == "/history":
-            print_history(messages, limit=DEFAULT_HISTORY_LIMIT)
+        if current_session_id == AGENT_CHAT_SENTINEL:
+            agent_result = run_personality_agent_chat()
+            if agent_result == "exit":
+                break
             continue
 
-        if user_input.lower() == "/summary":
-            print_summary(messages, session_metrics)
+        if current_session_id == AGENT_PLAN_TRAVEL_CHAT_SENTINEL:
+            travel_result = run_travel_plan_chat()
+            if travel_result == "exit":
+                break
             continue
 
-        if not user_input:
+        if current_session_id == AGENT_WEATHER_MCP_CHAT_SENTINEL:
+            weather_result = run_weather_mcp_chat()
+            if weather_result == "exit":
+                break
             continue
 
-        last_assistant_text = ""
-        if context_strategy == STRATEGY_ROLLING_SUMMARY:
-            last_assistant_text = get_last_assistant_message(messages)
-            request_messages = build_request_messages(
-                session_summary.get("summary", ""),
-                last_assistant_text,
-                user_input,
+        if current_session_id == VKUSVILL_CHAT_SENTINEL:
+            vkusvill_result = run_vkusvill_mcp_chat(
+                model_completion_with_stats,
+                print_ai_with_stats,
+                empty_completion_stats,
+                merge_completion_stats,
             )
+            if vkusvill_result == "exit":
+                break
+            continue
+
+        write_last_session_id(current_session_id)
+        context_strategy = choose_context_strategy(current_session_id)
+        session_metrics = load_metrics(current_session_id)
+        session_summary = load_summary(current_session_id)
+        session_facts = load_facts(current_session_id)
+        if context_strategy == STRATEGY_ROLLING_SUMMARY:
+            session_summary = bootstrap_summary_if_needed(current_session_id, messages, session_summary)
         elif context_strategy == STRATEGY_SLIDING_WINDOW:
-            request_messages = trim_messages_for_sliding_window(messages, 2)
-            request_messages.append({"role": "user", "content": user_input})
-        elif context_strategy == STRATEGY_STICKY_FACTS:
-            last_assistant_text = get_last_assistant_message(messages)
-            request_messages = build_sticky_facts_request_messages(
-                session_facts.get("facts", []),
-                last_assistant_text,
-                user_input,
-            )
-        else:
-            request_messages = list(messages)
-            request_messages.append({"role": "user", "content": user_input})
-
-        messages.append({"role": "user", "content": user_input})
-        if context_strategy == STRATEGY_SLIDING_WINDOW:
             messages = trim_messages_for_sliding_window(messages, 2)
-        save_session(current_session_id, messages)
+            save_session(current_session_id, messages)
 
-        started_at = time.perf_counter()
-        response = client.chat.completions.create(
-            model="openai/gpt-5.2",
-            messages=request_messages
+        print_history(messages, DEFAULT_HISTORY_LIMIT)
+        print(
+            f"\nTerminal chat started. Session: {current_session_id}. "
+            f"Strategy: {STRATEGY_LABELS[context_strategy]}. "
+            "Type 'exit' to quit. Use '/switch' to open session menu. "
+            "Use '/history all' to print full history. Use '/summary' for session stats."
         )
-        elapsed_seconds = time.perf_counter() - started_at
 
-        assistant_text = response.choices[0].message.content or ""
-        usage = response.usage
+        switch_requested = False
 
-        prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
-        completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
-        total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
+        while True:
+            user_input = input("You: ").strip()
 
-        input_cost = (prompt_tokens / 1_000_000) * INPUT_PRICE_PER_1M
-        output_cost = (completion_tokens / 1_000_000) * OUTPUT_PRICE_PER_1M
-        total_cost = input_cost + output_cost
-
-        session_metrics["response_count"] += 1
-        session_metrics["prompt_tokens"] += prompt_tokens
-        session_metrics["completion_tokens"] += completion_tokens
-        session_metrics["total_tokens"] += total_tokens
-        session_metrics["input_cost"] += input_cost
-        session_metrics["output_cost"] += output_cost
-        session_metrics["total_cost"] += total_cost
-        session_metrics["total_response_time_sec"] += elapsed_seconds
-
-        print(f"AI: {assistant_text}")
-        print(f"Prompt tokens: {prompt_tokens}")
-        print(f"Completion tokens: {completion_tokens}")
-        print(f"Total tokens: {total_tokens}")
-        print(f"Response time: {elapsed_seconds:.2f} sec")
-        print(f"Input cost: {input_cost:.6f} {CURRENCY}")
-        print(f"Output cost: {output_cost:.6f} {CURRENCY}")
-        print(f"Total cost: {total_cost:.6f} {CURRENCY}")
-
-        if context_strategy == STRATEGY_ROLLING_SUMMARY:
-            summary_chunk = []
-            if last_assistant_text:
-                summary_chunk.append({"role": "assistant", "content": last_assistant_text})
-            summary_chunk.append({"role": "user", "content": user_input})
-            session_summary["summary"] = update_running_summary(
-                session_summary.get("summary", ""),
-                summary_chunk,
-            )
-            save_summary(current_session_id, session_summary)
-
-        messages.append({"role": "assistant", "content": assistant_text})
-        if context_strategy == STRATEGY_SLIDING_WINDOW:
-            messages = trim_messages_for_sliding_window(messages, 2)
-        save_session(current_session_id, messages)
-        save_metrics(current_session_id, session_metrics)
-
-        if context_strategy == STRATEGY_STICKY_FACTS:
-            while True:
-                fact_input = input(
-                    "Add fact for next context (enter 0 to skip): "
-                ).strip()
-                if fact_input == "0":
-                    break
-
-                if not fact_input:
-                    print("Please enter a fact or 0 to skip.")
-                    continue
-
-                session_facts["facts"].append(fact_input)
-                save_facts(current_session_id, session_facts)
-                print("Fact saved.")
+            if user_input.lower() in {"exit", "quit"}:
+                print("Bye!")
                 break
 
-    if not switch_requested:
-        break
+            if user_input.lower() == "/switch":
+                print("Returning to session menu...")
+                switch_requested = True
+                break
+
+            if user_input.lower() == "/history all":
+                print_history(messages, limit=None)
+                continue
+
+            if user_input.lower() == "/history":
+                print_history(messages, limit=DEFAULT_HISTORY_LIMIT)
+                continue
+
+            if user_input.lower() == "/summary":
+                print_summary(messages, session_metrics)
+                continue
+
+            if not user_input:
+                continue
+
+            last_assistant_text = ""
+            if context_strategy == STRATEGY_ROLLING_SUMMARY:
+                last_assistant_text = get_last_assistant_message(messages)
+                request_messages = build_request_messages(
+                    session_summary.get("summary", ""),
+                    last_assistant_text,
+                    user_input,
+                )
+            elif context_strategy == STRATEGY_SLIDING_WINDOW:
+                request_messages = trim_messages_for_sliding_window(messages, 2)
+                request_messages.append({"role": "user", "content": user_input})
+            elif context_strategy == STRATEGY_STICKY_FACTS:
+                last_assistant_text = get_last_assistant_message(messages)
+                request_messages = build_sticky_facts_request_messages(
+                    session_facts.get("facts", []),
+                    last_assistant_text,
+                    user_input,
+                )
+            else:
+                request_messages = list(messages)
+                request_messages.append({"role": "user", "content": user_input})
+
+            messages.append({"role": "user", "content": user_input})
+            if context_strategy == STRATEGY_SLIDING_WINDOW:
+                messages = trim_messages_for_sliding_window(messages, 2)
+            save_session(current_session_id, messages)
+
+            started_at = time.perf_counter()
+            response = client.chat.completions.create(
+                model="openai/gpt-5.2",
+                messages=request_messages
+            )
+            elapsed_seconds = time.perf_counter() - started_at
+
+            assistant_text = response.choices[0].message.content or ""
+            usage = response.usage
+
+            prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+            completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+            total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
+
+            input_cost = (prompt_tokens / 1_000_000) * INPUT_PRICE_PER_1M
+            output_cost = (completion_tokens / 1_000_000) * OUTPUT_PRICE_PER_1M
+            total_cost = input_cost + output_cost
+
+            session_metrics["response_count"] += 1
+            session_metrics["prompt_tokens"] += prompt_tokens
+            session_metrics["completion_tokens"] += completion_tokens
+            session_metrics["total_tokens"] += total_tokens
+            session_metrics["input_cost"] += input_cost
+            session_metrics["output_cost"] += output_cost
+            session_metrics["total_cost"] += total_cost
+            session_metrics["total_response_time_sec"] += elapsed_seconds
+
+            print(f"AI: {assistant_text}")
+            print(f"Prompt tokens: {prompt_tokens}")
+            print(f"Completion tokens: {completion_tokens}")
+            print(f"Total tokens: {total_tokens}")
+            print(f"Response time: {elapsed_seconds:.2f} sec")
+            print(f"Input cost: {input_cost:.6f} {CURRENCY}")
+            print(f"Output cost: {output_cost:.6f} {CURRENCY}")
+            print(f"Total cost: {total_cost:.6f} {CURRENCY}")
+
+            if context_strategy == STRATEGY_ROLLING_SUMMARY:
+                summary_chunk = []
+                if last_assistant_text:
+                    summary_chunk.append({"role": "assistant", "content": last_assistant_text})
+                summary_chunk.append({"role": "user", "content": user_input})
+                session_summary["summary"] = update_running_summary(
+                    session_summary.get("summary", ""),
+                    summary_chunk,
+                )
+                save_summary(current_session_id, session_summary)
+
+            messages.append({"role": "assistant", "content": assistant_text})
+            if context_strategy == STRATEGY_SLIDING_WINDOW:
+                messages = trim_messages_for_sliding_window(messages, 2)
+            save_session(current_session_id, messages)
+            save_metrics(current_session_id, session_metrics)
+
+            if context_strategy == STRATEGY_STICKY_FACTS:
+                while True:
+                    fact_input = input(
+                        "Add fact for next context (enter 0 to skip): "
+                    ).strip()
+                    if fact_input == "0":
+                        break
+
+                    if not fact_input:
+                        print("Please enter a fact or 0 to skip.")
+                        continue
+
+                    session_facts["facts"].append(fact_input)
+                    save_facts(current_session_id, session_facts)
+                    print("Fact saved.")
+                    break
+
+        if not switch_requested:
+            break
+
+
+if __name__ == "__main__":
+    main()
