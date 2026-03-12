@@ -1,12 +1,14 @@
 import asyncio
 import ast
 import json
+import queue
 import re
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from openai import OpenAI
 from vkusvill_mcp_chat import VKUSVILL_CHAT_SENTINEL, run_vkusvill_mcp_chat, to_plain_data
@@ -120,6 +122,10 @@ WEATHER_RESPONSE_SYSTEM_PROMPT = (
     "If status is ok, summarize the current weather and available forecast briefly.\n"
     "No markdown tables."
 )
+WEATHER_AUTO_LOCATION = "Москва, Россия"
+WEATHER_AUTO_DAYS = 1
+WEATHER_AUTO_INTERVAL_SECONDS = 30.0
+WEATHER_AUTO_COMMAND_PROMPT = "Command: "
 
 HISTORY_DIR = Path("history")
 LAST_SESSION_FILE = HISTORY_DIR / "last_session.txt"
@@ -1313,6 +1319,69 @@ def update_weather_state_from_tool(state: dict, tool_payload: dict) -> None:
     state["last_candidates"] = []
 
 
+class WeatherAutoCommandReader:
+    def __init__(
+        self,
+        prompt: str = WEATHER_AUTO_COMMAND_PROMPT,
+        input_fn: Callable[[str], str] = input,
+    ) -> None:
+        self.prompt = prompt
+        self.input_fn = input_fn
+        self._commands: queue.Queue[str] = queue.Queue()
+        self._stop_event = threading.Event()
+        self._read_permission = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+
+        self._read_permission.set()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="weather-auto-command-reader",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self._read_permission.wait()
+            if self._stop_event.is_set():
+                return
+
+            self._read_permission.clear()
+            try:
+                command = self.input_fn(self.prompt)
+            except (EOFError, KeyboardInterrupt):
+                command = "exit"
+            except Exception:
+                command = "exit"
+
+            if self._stop_event.is_set():
+                return
+
+            self._commands.put("" if command is None else str(command))
+
+    def get_command(self, timeout: float) -> Optional[str]:
+        try:
+            return self._commands.get(timeout=max(0.0, timeout))
+        except queue.Empty:
+            return None
+
+    def acknowledge_command(self) -> None:
+        if not self._stop_event.is_set():
+            self._read_permission.set()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._read_permission.set()
+        if self._thread is None:
+            return
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=0.1)
+
+
 class invariant:
     def __init__(self, max_clarifications: int = 2):
         self.max_clarifications = max_clarifications
@@ -1578,16 +1647,10 @@ def run_travel_plan_chat() -> str:
         show_draft_plan(draft_plan)
 
 
-def run_weather_mcp_chat() -> str:
-    availability_error = weather_mcp_availability_error()
-    if availability_error:
-        print(f"\nWeather via MCP is unavailable: {availability_error}")
-        return "switch"
-
-    state = new_weather_chat_state()
+def run_manual_weather_mcp_chat(state: dict) -> str:
     print(
         "\nWeather via MCP chat started. "
-        "Type 'exit' to quit program or '/switch' to return session menu."
+        "Type 'exit' to quit program or '/switch' to return weather menu."
     )
 
     while True:
@@ -1598,7 +1661,7 @@ def run_weather_mcp_chat() -> str:
             return "exit"
 
         if user_input.lower() == "/switch":
-            print("Returning to session menu...")
+            print("Returning to weather menu...")
             return "switch"
 
         if not user_input:
@@ -1640,6 +1703,101 @@ def run_weather_mcp_chat() -> str:
 
         append_weather_message(state, "user", user_input)
         append_weather_message(state, "assistant", assistant_text)
+
+
+def print_auto_weather_update(tool_payload: dict, tool_elapsed_seconds: float) -> None:
+    updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n[{updated_at}] Автообновление погоды для {WEATHER_AUTO_LOCATION}")
+    print(f"Weather: {fallback_weather_response(tool_payload)}")
+    print(f"MCP tool time: {tool_elapsed_seconds:.2f} sec")
+
+
+def run_auto_moscow_weather_loop(
+    command_reader: Optional[WeatherAutoCommandReader] = None,
+    time_fn: Callable[[], float] = time.monotonic,
+    interval_seconds: float = WEATHER_AUTO_INTERVAL_SECONDS,
+    location: str = WEATHER_AUTO_LOCATION,
+    days: int = WEATHER_AUTO_DAYS,
+) -> str:
+    print(
+        "\nАвтообновление погоды для Москвы запущено. "
+        "Используйте '/switch' для возврата в weather menu или 'exit' для выхода."
+    )
+
+    reader = command_reader or WeatherAutoCommandReader()
+    reader.start()
+    next_update_at = time_fn()
+
+    try:
+        while True:
+            now = time_fn()
+            if now >= next_update_at:
+                tool_payload, tool_elapsed_seconds = call_weather_tool_via_mcp(location, days)
+                print_auto_weather_update(tool_payload, tool_elapsed_seconds)
+                next_update_at = time_fn() + interval_seconds
+                continue
+
+            command = reader.get_command(next_update_at - now)
+            if command is None:
+                continue
+
+            normalized_command = str(command).strip()
+            if not normalized_command:
+                reader.acknowledge_command()
+                continue
+
+            lowered_command = normalized_command.lower()
+            if lowered_command in {"exit", "quit"}:
+                print("Bye!")
+                return "exit"
+
+            if lowered_command == "/switch":
+                print("Returning to weather menu...")
+                return "switch"
+
+            print("Unknown command. Use '/switch' to return to weather menu or 'exit' to quit.")
+            reader.acknowledge_command()
+    finally:
+        reader.stop()
+
+
+def run_weather_mcp_chat() -> str:
+    availability_error = weather_mcp_availability_error()
+    if availability_error:
+        print(f"\nWeather via MCP is unavailable: {availability_error}")
+        return "switch"
+
+    state = new_weather_chat_state()
+
+    while True:
+        print("\nWeather via MCP")
+        print("1) Manual weather request")
+        print("2) Присылать данные о погоде на сегодня в Москве каждые 30 секунд")
+        print("3) Back to session menu")
+        choice = input("Select option: ").strip()
+
+        lowered_choice = choice.lower()
+        if lowered_choice in {"exit", "quit"}:
+            print("Bye!")
+            return "exit"
+
+        if lowered_choice == "/switch" or choice == "3":
+            print("Returning to session menu...")
+            return "switch"
+
+        if choice == "1":
+            result = run_manual_weather_mcp_chat(state)
+            if result == "exit":
+                return "exit"
+            continue
+
+        if choice == "2":
+            result = run_auto_moscow_weather_loop()
+            if result == "exit":
+                return "exit"
+            continue
+
+        print("Invalid option. Try again.")
 
 
 def load_strategy(session_id: str) -> int:
