@@ -126,6 +126,7 @@ WEATHER_AUTO_LOCATION = "Москва, Россия"
 WEATHER_AUTO_DAYS = 1
 WEATHER_AUTO_INTERVAL_SECONDS = 30.0
 WEATHER_AUTO_COMMAND_PROMPT = "Command: "
+WEATHER_AUTO_RESULTS_DIR = Path("weather_auto_sessions")
 
 HISTORY_DIR = Path("history")
 LAST_SESSION_FILE = HISTORY_DIR / "last_session.txt"
@@ -147,6 +148,10 @@ client = OpenAI(
 
 def ensure_history_dir() -> None:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_weather_auto_results_dir() -> None:
+    WEATHER_AUTO_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def ensure_tod_dirs() -> None:
@@ -176,6 +181,14 @@ def facts_path(session_id: str) -> Path:
 
 def metrics_path(session_id: str) -> Path:
     return HISTORY_DIR / f"session_{session_id}_metrics.json"
+
+
+def create_weather_auto_session_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def weather_auto_session_path(session_id: str) -> Path:
+    return WEATHER_AUTO_RESULTS_DIR / f"session_{session_id}.txt"
 
 
 def create_session_id() -> str:
@@ -1705,11 +1718,34 @@ def run_manual_weather_mcp_chat(state: dict) -> str:
         append_weather_message(state, "assistant", assistant_text)
 
 
-def print_auto_weather_update(tool_payload: dict, tool_elapsed_seconds: float) -> None:
+def build_auto_weather_update_text(tool_payload: dict, tool_elapsed_seconds: float) -> str:
     updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\n[{updated_at}] Автообновление погоды для {WEATHER_AUTO_LOCATION}")
-    print(f"Weather: {fallback_weather_response(tool_payload)}")
-    print(f"MCP tool time: {tool_elapsed_seconds:.2f} sec")
+    return "\n".join(
+        [
+            f"[{updated_at}] Автообновление погоды для {WEATHER_AUTO_LOCATION}",
+            f"Weather: {fallback_weather_response(tool_payload)}",
+            f"MCP tool time: {tool_elapsed_seconds:.2f} sec",
+        ]
+    )
+
+
+def print_auto_weather_update(tool_payload: dict, tool_elapsed_seconds: float) -> str:
+    update_text = build_auto_weather_update_text(tool_payload, tool_elapsed_seconds)
+    print(f"\n{update_text}")
+    return update_text
+
+
+def append_weather_auto_session_entry(session_path: Path, entry_text: str) -> None:
+    ensure_weather_auto_results_dir()
+    prefix = ""
+    if session_path.exists() and session_path.stat().st_size > 0:
+        prefix = "\n\n"
+
+    with session_path.open("a", encoding="utf-8") as session_file:
+        if prefix:
+            session_file.write(prefix)
+        session_file.write(entry_text.rstrip())
+        session_file.write("\n")
 
 
 def run_auto_moscow_weather_loop(
@@ -1719,10 +1755,12 @@ def run_auto_moscow_weather_loop(
     location: str = WEATHER_AUTO_LOCATION,
     days: int = WEATHER_AUTO_DAYS,
 ) -> str:
+    session_path = weather_auto_session_path(create_weather_auto_session_id())
     print(
         "\nАвтообновление погоды для Москвы запущено. "
         "Используйте '/switch' для возврата в weather menu или 'exit' для выхода."
     )
+    print(f"Файл сессии: {session_path}")
 
     reader = command_reader or WeatherAutoCommandReader()
     reader.start()
@@ -1733,7 +1771,12 @@ def run_auto_moscow_weather_loop(
             now = time_fn()
             if now >= next_update_at:
                 tool_payload, tool_elapsed_seconds = call_weather_tool_via_mcp(location, days)
-                print_auto_weather_update(tool_payload, tool_elapsed_seconds)
+                update_text = print_auto_weather_update(tool_payload, tool_elapsed_seconds)
+                try:
+                    append_weather_auto_session_entry(session_path, update_text)
+                    print(f"Информация записана в файл: {session_path}")
+                except OSError as error:
+                    print(f"Не удалось записать информацию в файл: {error}")
                 next_update_at = time_fn() + interval_seconds
                 continue
 
