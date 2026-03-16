@@ -11,7 +11,18 @@ import time
 from typing import Any, Callable, Optional
 
 from openai import OpenAI
-from vkusvill_mcp_chat import VKUSVILL_CHAT_SENTINEL, run_vkusvill_mcp_chat, to_plain_data
+from vkusvill_mcp_chat import (
+    VKUSVILL_CHAT_SENTINEL,
+    discover_tools_via_mcp,
+    format_exception_for_user,
+    new_vkusvill_state,
+    process_vkusvill_turn,
+    resolve_vkusvill_endpoint,
+    run_vkusvill_mcp_chat,
+    to_plain_data,
+    vkusvill_mcp_availability_error,
+    vkusvill_memory_text,
+)
 
 YOUR_API_KEY = ""
 # Set your actual prices from routerai.ru.
@@ -122,6 +133,21 @@ WEATHER_RESPONSE_SYSTEM_PROMPT = (
     "If status is ok, summarize the current weather and available forecast briefly.\n"
     "No markdown tables."
 )
+MULTIMCP_ROUTER_DEFAULT_CLARIFICATION = (
+    "Уточните, вам нужна погода или подбор продуктов?"
+)
+MULTIMCP_ROUTER_SYSTEM_PROMPT = (
+    "You route user messages inside a combined MultiMCP chat.\n"
+    "Return only one JSON object with keys: action, domain, clarification.\n"
+    "Rules:\n"
+    "- action must be exactly 'route' or 'clarify'\n"
+    "- domain must be exactly 'weather', 'vkusvill', or empty string\n"
+    "- clarification must be a short Russian question when action='clarify', otherwise empty\n"
+    "- choose 'weather' only for weather forecast, temperature, precipitation, or weather follow-up requests\n"
+    "- choose 'vkusvill' only for shopping, grocery, product search, or basket-building requests\n"
+    "- if the message mixes both domains or you are not confident, use action='clarify'\n"
+    "Do not add markdown or text outside JSON."
+)
 WEATHER_AUTO_LOCATION = "Москва, Россия"
 WEATHER_AUTO_DAYS = 1
 WEATHER_AUTO_INTERVAL_SECONDS = 30.0
@@ -138,6 +164,43 @@ TOD_CHAT_SENTINEL = "__TOD_CHAT__"
 AGENT_CHAT_SENTINEL = "__PERSONALITY_AGENT_CHAT__"
 AGENT_PLAN_TRAVEL_CHAT_SENTINEL = "__AGENT_PLAN_TRAVEL_CHAT__"
 AGENT_WEATHER_MCP_CHAT_SENTINEL = "__AGENT_WEATHER_MCP_CHAT__"
+MULTIMCP_CHAT_SENTINEL = "__MULTIMCP_CHAT__"
+
+MULTIMCP_WEATHER_HINTS = (
+    "погода",
+    "прогноз",
+    "температур",
+    "дожд",
+    "снег",
+    "ветер",
+    "градус",
+    "пасмур",
+    "солнеч",
+)
+MULTIMCP_WEATHER_FOLLOWUP_HINTS = (
+    "сегодня",
+    "завтра",
+    "послезавтра",
+    "сейчас",
+    "там",
+    "тут",
+    "здесь",
+)
+MULTIMCP_PRODUCT_HINTS = (
+    "корзин",
+    "товар",
+    "продукт",
+    "вкусвилл",
+    "купи",
+    "купить",
+    "добавь",
+    "добавить",
+    "подбери",
+    "подобрать",
+    "найди",
+    "собери",
+    "закажи",
+)
 
 
 client = OpenAI(
@@ -802,7 +865,27 @@ def new_weather_chat_state() -> dict:
     }
 
 
+def new_multi_mcp_state() -> dict:
+    return {
+        "messages": [],
+        "last_domain": "",
+        "pending_domain_clarification": False,
+        "weather_state": new_weather_chat_state(),
+        "weather_ready": False,
+        "vkusvill_state": None,
+        "vkusvill_endpoint": "",
+        "vkusvill_discovered_tools": [],
+        "vkusvill_ready": False,
+    }
+
+
 def append_weather_message(state: dict, role: str, content: str, limit: int = 8) -> None:
+    state["messages"].append({"role": role, "content": content})
+    if len(state["messages"]) > limit:
+        state["messages"] = state["messages"][-limit:]
+
+
+def append_multi_mcp_message(state: dict, role: str, content: str, limit: int = 10) -> None:
     state["messages"].append({"role": role, "content": content})
     if len(state["messages"]) > limit:
         state["messages"] = state["messages"][-limit:]
@@ -826,6 +909,32 @@ def weather_memory_text(state: dict) -> str:
             cleaned = str(label).strip()
             if cleaned:
                 lines.append(f"  {idx}. {cleaned}")
+
+    if not lines:
+        return "(empty)"
+    return "\n".join(lines)
+
+
+def multi_mcp_memory_text(state: dict) -> str:
+    lines = []
+
+    last_domain = str(state.get("last_domain", "")).strip()
+    if last_domain:
+        lines.append(f"- Last routed domain: {last_domain}")
+
+    weather_state = state.get("weather_state")
+    if isinstance(weather_state, dict):
+        weather_text = weather_memory_text(weather_state)
+        if weather_text != "(empty)":
+            lines.append("Weather memory:")
+            lines.append(weather_text)
+
+    vkusvill_state = state.get("vkusvill_state")
+    if isinstance(vkusvill_state, dict):
+        vv_text = vkusvill_memory_text(vkusvill_state)
+        if vv_text != "(empty)":
+            lines.append("VkusVill memory:")
+            lines.append(vv_text)
 
     if not lines:
         return "(empty)"
@@ -861,6 +970,62 @@ def build_weather_intent_messages(state: dict, user_input: str) -> list[dict]:
             ),
         },
     ]
+
+
+def build_multi_mcp_router_messages(state: dict, user_input: str) -> list[dict]:
+    history_lines = []
+    for item in state.get("messages", [])[-6:]:
+        role = item.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        prefix = "User" if role == "user" else "Assistant"
+        history_lines.append(f"{prefix}: {content}")
+
+    history_text = "\n".join(history_lines) if history_lines else "(empty)"
+    memory_text = multi_mcp_memory_text(state)
+    current_date = datetime.now().strftime("%Y-%m-%d")
+
+    return [
+        {"role": "system", "content": MULTIMCP_ROUTER_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Today: {current_date}\n\n"
+                f"Recent MultiMCP chat:\n{history_text}\n\n"
+                f"Combined memory:\n{memory_text}\n\n"
+                f"Latest user message:\n{user_input}\n\n"
+                "Return JSON only."
+            ),
+        },
+    ]
+
+
+def normalize_multi_mcp_route(payload: dict) -> dict:
+    action = str(payload.get("action", "")).strip().lower()
+    domain = str(payload.get("domain", "")).strip().lower()
+    clarification = str(payload.get("clarification", "")).strip()
+
+    if action not in {"route", "clarify"}:
+        action = "clarify"
+
+    if domain not in {"weather", "vkusvill"}:
+        domain = ""
+
+    if action == "route" and not domain:
+        action = "clarify"
+
+    if action == "clarify":
+        clarification = clarification or MULTIMCP_ROUTER_DEFAULT_CLARIFICATION
+        domain = ""
+
+    return {
+        "action": action,
+        "domain": domain,
+        "clarification": clarification,
+    }
 
 
 def normalize_weather_intent(payload: dict) -> dict:
@@ -1102,6 +1267,104 @@ def extract_weather_intent(state: dict, user_input: str) -> tuple[dict, dict]:
     if payload is None:
         return fallback_weather_intent(state, user_input), stats
     return normalize_weather_intent(payload), stats
+
+
+def multi_mcp_matches_any(text: str, hints: tuple[str, ...]) -> bool:
+    lowered = str(text or "").lower()
+    return any(hint in lowered for hint in hints)
+
+
+def extract_multi_mcp_domain_choice(user_input: str) -> Optional[str]:
+    lowered = str(user_input or "").strip().lower()
+    if not lowered:
+        return None
+
+    if any(hint in lowered for hint in ("погод", "weather")):
+        return "weather"
+
+    if any(
+        hint in lowered
+        for hint in (
+            "продукт",
+            "товар",
+            "корзин",
+            "вкусвилл",
+            "покуп",
+            "подбор продуктов",
+            "подобрать продукты",
+            "продукты",
+        )
+    ):
+        return "vkusvill"
+
+    return None
+
+
+def looks_like_weather_follow_up(state: dict, user_input: str) -> bool:
+    lowered = str(user_input or "").lower()
+    if multi_mcp_matches_any(lowered, MULTIMCP_WEATHER_HINTS):
+        return True
+    if str(state.get("last_domain", "")).strip() != "weather":
+        return False
+    if multi_mcp_matches_any(lowered, MULTIMCP_WEATHER_FOLLOWUP_HINTS):
+        return True
+
+    weather_state = state.get("weather_state")
+    if isinstance(weather_state, dict):
+        intent = fallback_weather_intent(weather_state, user_input)
+        if intent.get("action") == "lookup":
+            return True
+    return False
+
+
+def looks_like_product_follow_up(state: dict, user_input: str) -> bool:
+    lowered = str(user_input or "").lower()
+    if multi_mcp_matches_any(lowered, MULTIMCP_PRODUCT_HINTS):
+        return True
+    if multi_mcp_matches_any(lowered, MULTIMCP_WEATHER_HINTS):
+        return False
+    if str(state.get("last_domain", "")).strip() != "vkusvill":
+        return False
+    return any(marker in lowered for marker in ("добав", "еще", "ещё", "замен", "аналог", "убери", "нужно"))
+
+
+def fallback_multi_mcp_route(state: dict, user_input: str) -> dict:
+    is_weather = looks_like_weather_follow_up(state, user_input)
+    is_product = looks_like_product_follow_up(state, user_input)
+
+    if is_weather and is_product:
+        return {
+            "action": "clarify",
+            "domain": "",
+            "clarification": MULTIMCP_ROUTER_DEFAULT_CLARIFICATION,
+        }
+    if is_weather:
+        return {"action": "route", "domain": "weather", "clarification": ""}
+    if is_product:
+        return {"action": "route", "domain": "vkusvill", "clarification": ""}
+    return {
+        "action": "clarify",
+        "domain": "",
+        "clarification": MULTIMCP_ROUTER_DEFAULT_CLARIFICATION,
+    }
+
+
+def extract_multi_mcp_route(state: dict, user_input: str) -> tuple[dict, dict]:
+    request_messages = build_multi_mcp_router_messages(state, user_input)
+    try:
+        assistant_text, stats = model_completion_with_stats(request_messages)
+    except Exception:
+        return fallback_multi_mcp_route(state, user_input), empty_completion_stats()
+
+    payload = parse_json_object(assistant_text)
+    if payload is None:
+        return fallback_multi_mcp_route(state, user_input), stats
+    normalized = normalize_multi_mcp_route(payload)
+    if normalized["action"] == "route":
+        fallback_route = fallback_multi_mcp_route(state, user_input)
+        if fallback_route["action"] == "clarify" and normalized["domain"] not in {"weather", "vkusvill"}:
+            return fallback_route, stats
+    return normalized, stats
 
 
 def fallback_weather_response(tool_payload: dict) -> str:
@@ -1660,6 +1923,69 @@ def run_travel_plan_chat() -> str:
         show_draft_plan(draft_plan)
 
 
+def process_weather_turn(
+    state: dict,
+    user_input: str,
+    call_tool_fn: Optional[Callable[[str, int], tuple[dict, float]]] = None,
+) -> dict:
+    total_started_at = time.perf_counter()
+    if call_tool_fn is None:
+        call_tool_fn = call_weather_tool_via_mcp
+
+    try:
+        weather_intent, intent_stats = extract_weather_intent(state, user_input)
+    except Exception as error:
+        assistant_text = f"Не удалось обработать запрос о погоде: {error}"
+        append_weather_message(state, "user", user_input)
+        append_weather_message(state, "assistant", assistant_text)
+        state["last_tool_status"] = "error"
+        return {
+            "assistant_text": assistant_text,
+            "stats": empty_completion_stats(),
+            "tool_time_seconds": 0.0,
+            "tool_summary_line": "",
+            "kind": "error",
+        }
+
+    if weather_intent["action"] == "clarify":
+        assistant_text = weather_intent["clarification"]
+        total_stats = merge_completion_stats(
+            [intent_stats],
+            elapsed_seconds=time.perf_counter() - total_started_at,
+        )
+        append_weather_message(state, "user", user_input)
+        append_weather_message(state, "assistant", assistant_text)
+        state["last_tool_status"] = "clarify"
+        return {
+            "assistant_text": assistant_text,
+            "stats": total_stats,
+            "tool_time_seconds": 0.0,
+            "tool_summary_line": "",
+            "kind": "clarify",
+        }
+
+    tool_payload, tool_elapsed_seconds = call_tool_fn(
+        weather_intent["location"],
+        weather_intent["days"],
+    )
+    update_weather_state_from_tool(state, tool_payload)
+    assistant_text, answer_stats = summarize_weather_tool_result(user_input, tool_payload)
+
+    total_stats = merge_completion_stats(
+        [intent_stats, answer_stats],
+        elapsed_seconds=time.perf_counter() - total_started_at,
+    )
+    append_weather_message(state, "user", user_input)
+    append_weather_message(state, "assistant", assistant_text)
+    return {
+        "assistant_text": assistant_text,
+        "stats": total_stats,
+        "tool_time_seconds": tool_elapsed_seconds,
+        "tool_summary_line": f"MCP tool time: {tool_elapsed_seconds:.2f} sec",
+        "kind": "response",
+    }
+
+
 def run_manual_weather_mcp_chat(state: dict) -> str:
     print(
         "\nWeather via MCP chat started. "
@@ -1680,42 +2006,10 @@ def run_manual_weather_mcp_chat(state: dict) -> str:
         if not user_input:
             continue
 
-        total_started_at = time.perf_counter()
-
-        try:
-            weather_intent, intent_stats = extract_weather_intent(state, user_input)
-        except Exception as error:
-            print(f"AI: Не удалось обработать запрос о погоде: {error}")
-            continue
-
-        if weather_intent["action"] == "clarify":
-            assistant_text = weather_intent["clarification"]
-            total_stats = merge_completion_stats(
-                [intent_stats],
-                elapsed_seconds=time.perf_counter() - total_started_at,
-            )
-            print_ai_with_stats(assistant_text, total_stats)
-            append_weather_message(state, "user", user_input)
-            append_weather_message(state, "assistant", assistant_text)
-            state["last_tool_status"] = "clarify"
-            continue
-
-        tool_payload, tool_elapsed_seconds = call_weather_tool_via_mcp(
-            weather_intent["location"],
-            weather_intent["days"],
-        )
-        update_weather_state_from_tool(state, tool_payload)
-        assistant_text, answer_stats = summarize_weather_tool_result(user_input, tool_payload)
-
-        total_stats = merge_completion_stats(
-            [intent_stats, answer_stats],
-            elapsed_seconds=time.perf_counter() - total_started_at,
-        )
-        print_ai_with_stats(assistant_text, total_stats)
-        print(f"MCP tool time: {tool_elapsed_seconds:.2f} sec")
-
-        append_weather_message(state, "user", user_input)
-        append_weather_message(state, "assistant", assistant_text)
+        result = process_weather_turn(state, user_input)
+        print_ai_with_stats(result["assistant_text"], result["stats"])
+        if result["tool_summary_line"]:
+            print(result["tool_summary_line"])
 
 
 def build_auto_weather_update_text(tool_payload: dict, tool_elapsed_seconds: float) -> str:
@@ -1841,6 +2135,157 @@ def run_weather_mcp_chat() -> str:
             continue
 
         print("Invalid option. Try again.")
+
+
+def ensure_multi_mcp_weather_ready(state: dict) -> Optional[str]:
+    if state.get("weather_ready"):
+        return None
+
+    availability_error = weather_mcp_availability_error()
+    if availability_error:
+        return availability_error
+
+    state["weather_ready"] = True
+    if not isinstance(state.get("weather_state"), dict):
+        state["weather_state"] = new_weather_chat_state()
+    return None
+
+
+def ensure_multi_mcp_vkusvill_ready(state: dict) -> Optional[str]:
+    if state.get("vkusvill_ready") and isinstance(state.get("vkusvill_state"), dict):
+        return None
+
+    availability_error = vkusvill_mcp_availability_error()
+    if availability_error:
+        return availability_error
+
+    endpoint = str(state.get("vkusvill_endpoint", "")).strip() or resolve_vkusvill_endpoint()
+    try:
+        discovered_tools, _discovery_elapsed = discover_tools_via_mcp(endpoint)
+    except Exception as error:
+        return format_exception_for_user(error, endpoint)
+
+    state["vkusvill_endpoint"] = endpoint
+    state["vkusvill_discovered_tools"] = discovered_tools
+    state["vkusvill_state"] = new_vkusvill_state(
+        endpoint=endpoint,
+        discovered_tools=discovered_tools,
+        persist_history=False,
+    )
+    state["vkusvill_ready"] = True
+    return None
+
+
+def run_multi_mcp_chat() -> str:
+    state = new_multi_mcp_state()
+
+    print(
+        "\nMultiMCP chat started. "
+        "Type 'exit' to quit program or '/switch' to return session menu."
+    )
+    print("You can ask about weather or product shopping in one session.")
+
+    while True:
+        user_input = input("You: ").strip()
+
+        if user_input.lower() in {"exit", "quit"}:
+            print("Bye!")
+            return "exit"
+
+        if user_input.lower() == "/switch":
+            print("Returning to session menu...")
+            return "switch"
+
+        if not user_input:
+            continue
+
+        total_started_at = time.perf_counter()
+        route_stats = empty_completion_stats()
+        if state.get("pending_domain_clarification"):
+            chosen_domain = extract_multi_mcp_domain_choice(user_input)
+            if chosen_domain is not None:
+                route_decision = {
+                    "action": "route",
+                    "domain": chosen_domain,
+                    "clarification": "",
+                }
+                state["pending_domain_clarification"] = False
+            else:
+                route_decision, route_stats = extract_multi_mcp_route(state, user_input)
+        else:
+            route_decision, route_stats = extract_multi_mcp_route(state, user_input)
+
+        if route_decision["action"] == "clarify":
+            assistant_text = route_decision["clarification"]
+            total_stats = merge_completion_stats(
+                [route_stats],
+                elapsed_seconds=time.perf_counter() - total_started_at,
+            )
+            print_ai_with_stats(assistant_text, total_stats)
+            append_multi_mcp_message(state, "user", user_input)
+            append_multi_mcp_message(state, "assistant", assistant_text)
+            state["pending_domain_clarification"] = True
+            continue
+
+        state["pending_domain_clarification"] = False
+        domain = route_decision["domain"]
+        if domain == "weather":
+            availability_error = ensure_multi_mcp_weather_ready(state)
+            if availability_error:
+                assistant_text = f"Weather via MCP is unavailable: {availability_error}"
+                total_stats = merge_completion_stats(
+                    [route_stats],
+                    elapsed_seconds=time.perf_counter() - total_started_at,
+                )
+                print_ai_with_stats(assistant_text, total_stats)
+                append_multi_mcp_message(state, "user", user_input)
+                append_multi_mcp_message(state, "assistant", assistant_text)
+                continue
+
+            result = process_weather_turn(state["weather_state"], user_input)
+            total_stats = merge_completion_stats(
+                [route_stats, result["stats"]],
+                elapsed_seconds=time.perf_counter() - total_started_at,
+            )
+            print_ai_with_stats(result["assistant_text"], total_stats)
+            if result["tool_summary_line"]:
+                print(result["tool_summary_line"])
+
+            append_multi_mcp_message(state, "user", user_input)
+            append_multi_mcp_message(state, "assistant", result["assistant_text"])
+            state["last_domain"] = "weather"
+            continue
+
+        availability_error = ensure_multi_mcp_vkusvill_ready(state)
+        if availability_error:
+            assistant_text = f"VkusVill MCP is unavailable: {availability_error}"
+            total_stats = merge_completion_stats(
+                [route_stats],
+                elapsed_seconds=time.perf_counter() - total_started_at,
+            )
+            print_ai_with_stats(assistant_text, total_stats)
+            append_multi_mcp_message(state, "user", user_input)
+            append_multi_mcp_message(state, "assistant", assistant_text)
+            continue
+
+        result = process_vkusvill_turn(
+            state["vkusvill_state"],
+            user_input,
+            model_completion_with_stats,
+            empty_completion_stats,
+            merge_completion_stats,
+        )
+        total_stats = merge_completion_stats(
+            [route_stats, result["stats"]],
+            elapsed_seconds=time.perf_counter() - total_started_at,
+        )
+        print_ai_with_stats(result["assistant_text"], total_stats)
+        if result["tool_summary_line"]:
+            print(result["tool_summary_line"])
+
+        append_multi_mcp_message(state, "user", user_input)
+        append_multi_mcp_message(state, "assistant", result["assistant_text"])
+        state["last_domain"] = "vkusvill"
 
 
 def load_strategy(session_id: str) -> int:
@@ -2191,6 +2636,8 @@ def choose_session() -> tuple[str, list[dict]]:
         print("- - -")
         print("VkusVill via MCP (type \"vkusvill mcp\" to starting this chat)")
         print("- - -")
+        print("MultiMCP (type \"MM\" to starting this chat)")
+        print("- - -")
 
         choice = input("Select option: ").strip()
         if choice.lower() == "tod":
@@ -2203,6 +2650,8 @@ def choose_session() -> tuple[str, list[dict]]:
             return AGENT_WEATHER_MCP_CHAT_SENTINEL, []
         if choice.lower() == "vkusvill mcp":
             return VKUSVILL_CHAT_SENTINEL, []
+        if choice.lower() == "mm":
+            return MULTIMCP_CHAT_SENTINEL, []
         action = option_map.get(choice)
 
         if action == "continue_last" and last_session_id:
@@ -2289,6 +2738,12 @@ def main() -> None:
                 merge_completion_stats,
             )
             if vkusvill_result == "exit":
+                break
+            continue
+
+        if current_session_id == MULTIMCP_CHAT_SENTINEL:
+            multi_result = run_multi_mcp_chat()
+            if multi_result == "exit":
                 break
             continue
 
